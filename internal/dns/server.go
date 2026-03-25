@@ -290,8 +290,13 @@ func (s *Server) resolveForContext(ctx context.Context, contextName, namespace, 
 	}
 
 	if ip := s.allocator.Lookup(key); ip != nil {
-		// VIP already allocated — re-resolve to get current port list (resolver
-		// uses its own cache so this is nearly free).
+		// VIP already allocated — reset the idle timer so repeated DNS queries
+		// keep the VIP and its port-forward listeners alive.
+		if s.forwardManager != nil {
+			s.forwardManager.TouchVIP(ip.String())
+		}
+		// Re-resolve to get current port list (resolver uses its own cache so
+		// this is nearly free).
 		var ports []k8s.ServicePort
 		if resolved, err := s.resolver.Resolve(ctx, contextName, namespace, svcName, podName); err == nil {
 			ports = resolved.Ports

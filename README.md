@@ -49,6 +49,7 @@ All configuration is via environment variables:
 | `HTTP_LISTEN` | `127.0.0.1:8080` | Control server listen address |
 | `DNS_LISTEN` | `127.0.0.1:0` | DNS server listen address |
 | `SOCKS_LISTEN` | `127.0.0.1:0` | SOCKS5 server listen address |
+| `VIP_IDLE_TIMEOUT` | `0` | The idle duration after which to release an allocated virtual IP. `0` disables the idle timeout. |
 
 ## Control endpoints
 

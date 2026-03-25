@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 )
 
 // Config holds all configuration for the proxy.
@@ -35,6 +36,11 @@ type Config struct {
 	// SOCKSListen is the address the SOCKS5 proxy binds to (e.g. "127.0.0.1:1080").
 	// Defaults to "127.0.0.1:0" (random port on loopback interface).
 	SOCKSListen string
+
+	// VIPIdleTimeout is how long a VIP and its port-forward TCP listeners are
+	// kept alive after the last active connection closes and no DNS queries
+	// have refreshed it. Zero (the default) disables idle expiry entirely.
+	VIPIdleTimeout time.Duration
 }
 
 // NewConfigFromEnvironment reads configuration from environment variables with sensible defaults.
@@ -47,6 +53,14 @@ func NewConfigFromEnvironment() (Config, error) {
 		HTTPListen:    getEnv("HTTP_LISTEN", "127.0.0.1:8080"),
 		DNSListen:     getEnv("DNS_LISTEN", "127.0.0.1:0"),
 		SOCKSListen:   getEnv("SOCKS_LISTEN", "127.0.0.1:0"),
+	}
+
+	if s := os.Getenv("VIP_IDLE_TIMEOUT"); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return Config{}, fmt.Errorf("VIP_IDLE_TIMEOUT: %w", err)
+		}
+		cfg.VIPIdleTimeout = d
 	}
 
 	if err := cfg.Validate(); err != nil {

@@ -117,6 +117,28 @@ func uint32ToIP(n uint32) net.IP {
 	return ip
 }
 
+// ReleaseVIP removes a single allocated VIP from the allocator's tracking and
+// from the network interface. It is a no-op if the IP was not allocated by
+// this allocator.
+func (a *Allocator) ReleaseVIP(ip net.IP) error {
+	addrStr := ip.String()
+
+	a.mu.Lock()
+	serviceKey, ok := a.reverse[addrStr]
+	if !ok {
+		a.mu.Unlock()
+		return nil
+	}
+	delete(a.assigned, serviceKey)
+	delete(a.reverse, addrStr)
+	a.mu.Unlock()
+
+	if err := a.addrManager.RemoveAddress(ip); err != nil {
+		return fmt.Errorf("removing VIP %s: %w", ip, err)
+	}
+	return nil
+}
+
 // Cleanup removes all allocated VIPs by calling RemoveAddress for each one.
 // Errors are collected but all VIPs are attempted.
 func (a *Allocator) Cleanup() error {

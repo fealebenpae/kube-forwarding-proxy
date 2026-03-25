@@ -243,3 +243,110 @@ func TestAllocate_SkipsAddressInUse(t *testing.T) {
 		t.Error("expected 198.18.0.1 to be in the skipped set")
 	}
 }
+
+func TestReleaseVIP_RemovesFromMaps(t *testing.T) {
+	removed := &[]string{}
+	var removeMu sync.Mutex
+	a, err := NewAllocator(&mockWithRemove{removed: removed, mu: &removeMu}, "198.18.0.0/24")
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+
+	ip, err := a.Allocate("default/svc-a")
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+
+	// Verify it's tracked.
+	if a.Lookup("default/svc-a") == nil {
+		t.Fatal("expected VIP to be allocated before release")
+	}
+	if a.ReverseLookup(ip.String()) == "" {
+		t.Fatal("expected reverse lookup to work before release")
+	}
+
+	// Release it.
+	if err := a.ReleaseVIP(ip); err != nil {
+		t.Fatalf("ReleaseVIP: %v", err)
+	}
+
+	// Both maps must be cleared.
+	if a.Lookup("default/svc-a") != nil {
+		t.Error("Lookup must return nil after ReleaseVIP")
+	}
+	if key := a.ReverseLookup(ip.String()); key != "" {
+		t.Errorf("ReverseLookup must return empty after ReleaseVIP, got %q", key)
+	}
+	if len(a.AllAllocations()) != 0 {
+		t.Errorf("AllAllocations must be empty after ReleaseVIP, got %d entries", len(a.AllAllocations()))
+	}
+
+	// RemoveAddress must have been called once with the released IP.
+	removeMu.Lock()
+	defer removeMu.Unlock()
+	if len(*removed) != 1 {
+		t.Errorf("RemoveAddress called %d times, want 1", len(*removed))
+	} else if (*removed)[0] != ip.String() {
+		t.Errorf("RemoveAddress called with %s, want %s", (*removed)[0], ip.String())
+	}
+}
+
+// mockWithRemove is an InterfaceAddressManager that records RemoveAddress calls.
+type mockWithRemove struct {
+	removed *[]string
+	mu      *sync.Mutex
+}
+
+func (m *mockWithRemove) AddAddress(_ net.IP) error { return nil }
+func (m *mockWithRemove) RemoveAddress(ip net.IP) error {
+	m.mu.Lock()
+	*m.removed = append(*m.removed, ip.String())
+	m.mu.Unlock()
+	return nil
+}
+
+func TestReleaseVIP_UnknownIP_Noop(t *testing.T) {
+	a, err := NewAllocator(&mockAddressManager{}, "198.18.0.0/24")
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+
+	// Releasing an IP that was never allocated should be a no-op with nil error.
+	if err := a.ReleaseVIP(net.IPv4(198, 18, 0, 99).To4()); err != nil {
+		t.Errorf("ReleaseVIP on unknown IP returned error: %v", err)
+	}
+}
+
+func TestReleaseVIP_CleanupAfterRelease(t *testing.T) {
+	removed := &[]string{}
+	var removeMu sync.Mutex
+	a, err := NewAllocator(&mockWithRemove{removed: removed, mu: &removeMu}, "198.18.0.0/24")
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+
+	ip1, _ := a.Allocate("ns/svc-1")
+	ip2, _ := a.Allocate("ns/svc-2")
+
+	// Release one VIP.
+	if err := a.ReleaseVIP(ip1); err != nil {
+		t.Fatalf("ReleaseVIP: %v", err)
+	}
+
+	// Cleanup should only remove the remaining VIP.
+	if err := a.Cleanup(); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	removeMu.Lock()
+	defer removeMu.Unlock()
+	if len(*removed) != 2 {
+		t.Errorf("expected 2 RemoveAddress calls (release + cleanup), got %d: %v", len(*removed), *removed)
+	}
+	if (*removed)[0] != ip1.String() {
+		t.Errorf("first remove: got %s, want %s", (*removed)[0], ip1.String())
+	}
+	if (*removed)[1] != ip2.String() {
+		t.Errorf("second remove: got %s, want %s", (*removed)[1], ip2.String())
+	}
+}

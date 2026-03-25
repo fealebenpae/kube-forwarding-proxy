@@ -98,7 +98,7 @@ func (s *Server) Start() error {
 	}
 
 	resolver := k8s.NewResolver(s.k8sManager, 15*time.Second)
-	s.forwardManager = k8s.NewForwardManager(s.k8sManager, resolver, s.logger.Named("forward"))
+	s.forwardManager = k8s.NewForwardManager(s.k8sManager, resolver, s.logger.Named("forward"), s.allocator, s.cfg.VIPIdleTimeout)
 
 	// Wire kubeconfig HTTP handler to the live managers.
 	kubeconfigHandler.SetManagers(s.k8sManager, s.forwardManager)

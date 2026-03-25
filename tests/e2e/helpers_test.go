@@ -71,7 +71,14 @@ func TestMain(m *testing.M) {
 // startProxy creates and starts an in-process proxy bound to loopback on
 // OS-assigned ports. A cleanup function is registered on t to stop the proxy.
 // The returned *app.Server has HTTPAddr, DNSAddr, and SOCKSAddr populated.
+// startProxy creates and starts an in-process proxy with default settings.
 func startProxy(t *testing.T) *app.Server {
+	return startProxyCustom(t, nil)
+}
+
+// startProxyCustom creates and starts an in-process proxy. mutate, if non-nil,
+// is called to override individual Config fields before the proxy starts.
+func startProxyCustom(t *testing.T, mutate func(*app.Config)) *app.Server {
 	t.Helper()
 	cfg := app.Config{
 		Interface:     "127.0.0.1",
@@ -81,6 +88,9 @@ func startProxy(t *testing.T) *app.Server {
 		HTTPListen:    "127.0.0.1:0",
 		DNSListen:     "127.0.0.1:0",
 		SOCKSListen:   "127.0.0.1:0",
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	logger, _ := zap.NewDevelopment()
 	srv := app.NewServer(cfg, logger.Sugar(), true /*dns*/, true /*socks*/)
@@ -795,3 +805,48 @@ func httpGetToVIP(t *testing.T, ip net.IP, port int) string {
 	t.Fatalf("GET %s failed after retries: %v", url, lastErr)
 	return ""
 }
+
+// ---------------------------------------------------------------------------
+// TCP connectivity helpers (used by idle-expiry tests)
+// ---------------------------------------------------------------------------
+
+// checkTCPConnectable tries a single non-retrying TCP dial to ip:port.
+// Returns true when the connection is established (and immediately closed),
+// false on any error (connection refused, timeout, etc.).
+func checkTCPConnectable(ip net.IP, port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// waitForTCPReachable polls checkTCPConnectable until it returns true or
+// timeout is exceeded.
+func waitForTCPReachable(t *testing.T, ip net.IP, port int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if checkTCPConnectable(ip, port) {
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	t.Fatalf("%s:%d did not become reachable within %s", ip, port, timeout)
+}
+
+// waitForTCPUnreachable polls checkTCPConnectable until it returns false or
+// timeout is exceeded.
+func waitForTCPUnreachable(t *testing.T, ip net.IP, port int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !checkTCPConnectable(ip, port) {
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	t.Fatalf("%s:%d was still reachable after %s — VIP listener should have expired", ip, port, timeout)
+}
+

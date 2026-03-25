@@ -18,10 +18,28 @@ import (
 	"k8s.io/client-go/transport/spdy"
 )
 
+// VIPReleaser is satisfied by vip.Allocator and allows ForwardManager to
+// release a single VIP from the network interface without importing the vip
+// package (which would create a circular dependency).
+type VIPReleaser interface {
+	ReleaseVIP(ip net.IP) error
+}
+
 // forwardEntry holds the TCP listener and the cancel func for its accept-loop goroutine.
 type forwardEntry struct {
 	listener net.Listener
 	cancel   context.CancelFunc
+}
+
+// vipState tracks idle-expiry state for a single virtual IP address. All
+// fields except activeConns are protected by mu. activeConns is always
+// accessed atomically.
+type vipState struct {
+	mu          sync.Mutex
+	timer       *time.Timer // nil when idleTimeout is zero
+	generation  uint64      // incremented on every timer re-arm; stale callbacks abort
+	activeConns atomic.Int32
+	forwardKeys []string // m.entries keys that belong to this VIP
 }
 
 // poolEntry is a cached SPDY connection shared across concurrent DialPortForward
@@ -44,33 +62,49 @@ type poolEntry struct {
 // concurrent port-forwards to the same pod share one underlying TCP connection
 // to the API server. Reference counting drives connection lifetime — the last
 // streamConn to close triggers eviction.
+//
+// When vipReleaser is non-nil and idleTimeout is positive, each VIP's TCP
+// listeners are automatically torn down and the VIP is released after the
+// configured idle period elapses with no active TCP connections. DNS re-queries
+// reset the timer via TouchVIP; active connections pause it.
 type ForwardManager struct {
-	clients  *ClientManager
-	resolver *Resolver
-	logger   *zap.SugaredLogger
+	clients     *ClientManager
+	resolver    *Resolver
+	logger      *zap.SugaredLogger
+	vipReleaser VIPReleaser   // nil disables idle expiry
+	idleTimeout time.Duration // 0 disables idle expiry
 
-	mu      sync.Mutex
-	entries map[string]*forwardEntry // "contextName/vip:svcPort" -> entry
+	// mu protects entries and vipStates. Lock ordering: always m.mu before
+	// state.mu. Never hold m.mu while calling vipReleaser.
+	mu        sync.Mutex
+	entries   map[string]*forwardEntry // "contextName/vip:svcPort" -> entry
+	vipStates map[string]*vipState     // vipAddr string -> state
 
 	spdyPoolMu sync.Mutex
 	spdyPool   map[string]*poolEntry // "contextName/namespace/podName" -> entry
 }
 
 // NewForwardManager creates a new ForwardManager.
-func NewForwardManager(clients *ClientManager, resolver *Resolver, logger *zap.SugaredLogger) *ForwardManager {
+// vipReleaser and idleTimeout activate idle-expiry behaviour: pass nil/0 to
+// disable it entirely and preserve the previous always-on semantics.
+func NewForwardManager(clients *ClientManager, resolver *Resolver, logger *zap.SugaredLogger, vipReleaser VIPReleaser, idleTimeout time.Duration) *ForwardManager {
 	return &ForwardManager{
-		clients:  clients,
-		resolver: resolver,
-		logger:   logger,
-		entries:  make(map[string]*forwardEntry),
-		spdyPool: make(map[string]*poolEntry),
+		clients:     clients,
+		resolver:    resolver,
+		logger:      logger,
+		vipReleaser: vipReleaser,
+		idleTimeout: idleTimeout,
+		entries:     make(map[string]*forwardEntry),
+		vipStates:   make(map[string]*vipState),
+		spdyPool:    make(map[string]*poolEntry),
 	}
 }
 
 // StartForward ensures a TCP listener is running on vipAddr:svcPort for the
 // given Kubernetes service in contextName. When contextName is empty the
 // current-context of the merged kubeconfig is used. Idempotent: a second call
-// for the same contextName/vipAddr/svcPort is silently ignored.
+// for the same contextName/vipAddr/svcPort resets the idle timer and returns
+// nil without starting a new listener.
 //
 // The listener is bound synchronously before StartForward returns, so callers
 // can connect immediately. Each accepted TCP connection independently resolves
@@ -83,6 +117,10 @@ func (m *ForwardManager) StartForward(_ context.Context, contextName, vipAddr st
 
 	m.mu.Lock()
 	if _, exists := m.entries[key]; exists {
+		// Listener already running — treat this call as a touch so that DNS
+		// re-queries (which go through resolveForContext → StartForward) reset
+		// the idle timer.
+		m.touchVIPLocked(vipAddr)
 		m.mu.Unlock()
 		return nil
 	}
@@ -99,12 +137,23 @@ func (m *ForwardManager) StartForward(_ context.Context, contextName, vipAddr st
 	m.mu.Lock()
 	// Double-check after re-acquiring: another goroutine may have raced us here.
 	if _, exists := m.entries[key]; exists {
+		m.touchVIPLocked(vipAddr)
 		m.mu.Unlock()
 		cancel()
 		_ = ln.Close()
 		return nil
 	}
 	m.entries[key] = entry
+
+	// Arm (or extend) the idle timer for this VIP.
+	if m.idleTimeout > 0 && m.vipReleaser != nil {
+		if state, ok := m.vipStates[vipAddr]; ok {
+			state.forwardKeys = append(state.forwardKeys, key)
+		} else {
+			m.vipStates[vipAddr] = &vipState{forwardKeys: []string{key}}
+		}
+		m.touchVIPLocked(vipAddr)
+	}
 	m.mu.Unlock()
 
 	m.logger.Infow("port-forward listener bound",
@@ -114,30 +163,147 @@ func (m *ForwardManager) StartForward(_ context.Context, contextName, vipAddr st
 		"service", svcName,
 	)
 
-	go m.listenLoop(loopCtx, ln, contextName, svcPort, namespace, svcName, podName)
+	go m.listenLoop(loopCtx, ln, contextName, vipAddr, svcPort, namespace, svcName, podName)
 	return nil
+}
+
+// touchVIPLocked resets the idle timer for vipAddr. It must be called while
+// holding m.mu. It is a no-op when idle expiry is disabled or the VIP has no
+// tracked state. The timer is not re-armed while active connections are
+// present; handleConn's deferred cleanup re-arms it when the last connection
+// closes.
+func (m *ForwardManager) touchVIPLocked(vipAddr string) {
+	if m.idleTimeout == 0 || m.vipReleaser == nil {
+		return
+	}
+	state, ok := m.vipStates[vipAddr]
+	if !ok {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.timer != nil {
+		state.timer.Stop()
+	}
+	if state.activeConns.Load() > 0 {
+		// Active connection(s) hold the timer. handleConn will re-arm it when
+		// the last connection closes.
+		return
+	}
+	state.generation++
+	gen := state.generation
+	state.timer = time.AfterFunc(m.idleTimeout, func() {
+		m.expireVIP(vipAddr, gen)
+	})
+}
+
+// TouchVIP resets the idle timer for vipAddr. It is safe to call concurrently.
+// Callers (e.g. the DNS server) should call this whenever a DNS query resolves
+// to an already-allocated VIP, to keep the VIP alive as long as it is being
+// actively queried.
+func (m *ForwardManager) TouchVIP(vipAddr string) {
+	m.mu.Lock()
+	m.touchVIPLocked(vipAddr)
+	m.mu.Unlock()
+}
+
+// expireVIP is called by the idle timer goroutine. It cancels all port-forward
+// listeners for vipAddr and releases the VIP from the interface. The gen
+// parameter is matched against the current generation in vipState to detect
+// stale timer firings (e.g. after TouchVIP reset the timer).
+func (m *ForwardManager) expireVIP(vipAddr string, gen uint64) {
+	m.mu.Lock()
+	state, ok := m.vipStates[vipAddr]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	state.mu.Lock()
+	if state.generation != gen || state.activeConns.Load() > 0 {
+		// Stale callback or a connection arrived just before the timer fired.
+		state.mu.Unlock()
+		m.mu.Unlock()
+		return
+	}
+	state.mu.Unlock()
+
+	for _, key := range state.forwardKeys {
+		if entry, exists := m.entries[key]; exists {
+			m.logger.Debugw("expiring idle port-forward listener", "key", key)
+			entry.cancel()
+			_ = entry.listener.Close()
+			delete(m.entries, key)
+		}
+	}
+	delete(m.vipStates, vipAddr)
+	m.mu.Unlock()
+
+	// Release the VIP outside m.mu to avoid lock-order inversion with the
+	// allocator's internal mutex.
+	ip := net.ParseIP(vipAddr)
+	if ip == nil {
+		m.logger.Warnw("expireVIP: could not parse VIP address", "vip", vipAddr)
+		return
+	}
+	if err := m.vipReleaser.ReleaseVIP(ip); err != nil {
+		m.logger.Warnw("failed to release expired VIP", "vip", vipAddr, "error", err)
+	}
 }
 
 // listenLoop accepts TCP connections on ln until the listener is closed or ctx
 // is cancelled, dispatching each to handleConn in its own goroutine.
-func (m *ForwardManager) listenLoop(ctx context.Context, ln net.Listener, contextName string, svcPort int32, namespace, svcName, podName string) {
+func (m *ForwardManager) listenLoop(ctx context.Context, ln net.Listener, contextName, vipAddr string, svcPort int32, namespace, svcName, podName string) {
 	defer func() { _ = ln.Close() }()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				return // normal shutdown via Shutdown()
+				return // normal shutdown via Shutdown() or expireVIP
 			}
 			m.logger.Warnw("accept error on port-forward listener", "error", err)
 			return
 		}
-		go m.handleConn(ctx, conn, contextName, svcPort, namespace, svcName, podName)
+		go m.handleConn(ctx, conn, contextName, vipAddr, svcPort, namespace, svcName, podName)
 	}
 }
 
 // handleConn opens a port-forward stream to a pod backing the service and
 // bidirectionally proxies conn over it for the connection's lifetime.
-func (m *ForwardManager) handleConn(ctx context.Context, conn net.Conn, contextName string, svcPort int32, namespace, svcName, podName string) {
+func (m *ForwardManager) handleConn(ctx context.Context, conn net.Conn, contextName, vipAddr string, svcPort int32, namespace, svcName, podName string) {
+	// Locate the vipState for idle-expiry tracking. We do this outside any
+	// deferred function so the state pointer is stable for the lifetime of this
+	// connection.
+	var connState *vipState
+	if m.idleTimeout > 0 && m.vipReleaser != nil {
+		m.mu.Lock()
+		connState = m.vipStates[vipAddr]
+		m.mu.Unlock()
+	}
+	if connState != nil {
+		connState.mu.Lock()
+		if connState.timer != nil {
+			connState.timer.Stop()
+		}
+		connState.activeConns.Add(1)
+		connState.mu.Unlock()
+	}
+
+	// Defers run LIFO: idle-timer re-arm fires last (after connections close).
+	defer func() {
+		if connState == nil {
+			return
+		}
+		connState.mu.Lock()
+		n := connState.activeConns.Add(-1)
+		if n == 0 && m.idleTimeout > 0 {
+			connState.generation++
+			gen := connState.generation
+			connState.timer = time.AfterFunc(m.idleTimeout, func() {
+				m.expireVIP(vipAddr, gen)
+			})
+		}
+		connState.mu.Unlock()
+	}()
 	defer func() {
 		if err := conn.Close(); err != nil {
 			m.logger.Warnw("closing accepted connection", "error", err)
@@ -339,7 +505,7 @@ func (m *ForwardManager) DialPortForward(ctx context.Context, contextName, names
 }
 
 // Shutdown closes all active listeners, stops their accept loops, and closes
-// all pooled SPDY connections.
+// all pooled SPDY connections. Any pending idle-expiry timers are cancelled.
 func (m *ForwardManager) Shutdown() {
 	m.mu.Lock()
 	for key, entry := range m.entries {
@@ -348,6 +514,14 @@ func (m *ForwardManager) Shutdown() {
 		_ = entry.listener.Close()
 		delete(m.entries, key)
 	}
+	for _, state := range m.vipStates {
+		state.mu.Lock()
+		if state.timer != nil {
+			state.timer.Stop()
+		}
+		state.mu.Unlock()
+	}
+	clear(m.vipStates)
 	m.mu.Unlock()
 
 	m.spdyPoolMu.Lock()
