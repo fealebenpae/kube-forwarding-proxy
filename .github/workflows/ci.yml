@@ -82,7 +82,6 @@ jobs:
           name: docker-image
       - name: Decompress image archive
         run: gunzip k8s-proxy.tar.gz
-      - uses: imjasonh/setup-crane@v0.5
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -92,5 +91,8 @@ jobs:
         run: |
           IMAGE=ghcr.io/${{ github.repository }}
           TAG=${{ github.ref_name }}
-          crane push k8s-proxy.tar "$IMAGE:$TAG"
-          crane tag "$IMAGE:$TAG" latest
+          TAG=${TAG#v}
+          mkdir -p /tmp/oci
+          tar xf k8s-proxy.tar -C /tmp/oci
+          skopeo copy --multi-arch all oci:/tmp/oci "docker://$IMAGE:$TAG"
+          skopeo copy --multi-arch all oci:/tmp/oci "docker://$IMAGE:latest"
