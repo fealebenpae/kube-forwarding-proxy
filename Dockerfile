@@ -23,9 +23,13 @@ RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /k8s-service-proxy /usr/local/bin/k8s-service-proxy
 
+# Sidecar-friendly defaults: bind privileged ports inside the container, and
+# use auto VIP aliasing (the image is intended to run with cap_add: NET_ADMIN
+# and a per-container bridge subnet — see README's compose example).
 ENV HTTP_LISTEN=:8080 \
     DNS_LISTEN=:53 \
-    SOCKS5_LISTEN=:1080
+    SOCKS_LISTEN=:1080 \
+    VIP_ALIAS_MODE=auto
 
 # DNS port
 EXPOSE 53/udp

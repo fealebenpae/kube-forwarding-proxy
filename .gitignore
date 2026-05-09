@@ -74,3 +74,9 @@ Temporary Items
 .ionide
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,go,visualstudiocode
+
+### Project ###
+bin/
+.idea/
+tmp/
+/k8s-service-proxy

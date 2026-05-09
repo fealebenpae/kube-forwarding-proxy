@@ -35,6 +35,30 @@ users:
 `, clusterName, server, contextName, clusterName, userName, contextName, userName)
 }
 
+// proxyKubeconfig is like minimalKubeconfig but adds a proxy-url so the
+// rewrite suffixes the names by the proxy port.
+func proxyKubeconfig(clusterName, contextName, userName, server, proxyURL string) string {
+	return fmt.Sprintf(`apiVersion: v1
+kind: Config
+clusters:
+- name: %s
+  cluster:
+    server: %s
+    proxy-url: %s
+    insecure-skip-tls-verify: true
+contexts:
+- name: %s
+  context:
+    cluster: %s
+    user: %s
+current-context: %s
+users:
+- name: %s
+  user:
+    token: test-token
+`, clusterName, server, proxyURL, contextName, clusterName, userName, contextName, userName)
+}
+
 // newTestHandler creates a KubeconfigHandler wired to a real ClientManager (no
 // file path so it starts empty) and a nil ForwardManager.
 func newTestHandler(t *testing.T) *KubeconfigHandler {
@@ -304,6 +328,84 @@ func TestKubeconfig_RoundTrip_PutThenGet(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("GET after PUT: body missing %q\n%s", want, body)
 		}
+	}
+}
+
+// --- Registrant suffixing by proxy port ---
+
+// Two registrants from different worktrees PATCH the same kubeconfig context
+// name (the canonical "kind-kind" case) but their proxy-urls have different
+// ports — different tunnels into different EVG hosts. The daemon must keep
+// both registrations addressable rather than overwriting one with the other.
+func TestKubeconfig_PATCH_DifferentProxyPortsCoexist(t *testing.T) {
+	h := newTestHandler(t)
+
+	a := proxyKubeconfig("kind-kind", "kind-kind", "user", "https://127.0.0.1:42565", "http://127.0.0.1:8026")
+	b := proxyKubeconfig("kind-kind", "kind-kind", "user", "https://127.0.0.1:37215", "http://127.0.0.1:8027")
+
+	if r := do(t, h, http.MethodPatch, a); r.StatusCode != http.StatusNoContent {
+		t.Fatalf("first PATCH: status=%d body=%s", r.StatusCode, bodyStr(t, r))
+	}
+	if r := do(t, h, http.MethodPatch, b); r.StatusCode != http.StatusNoContent {
+		t.Fatalf("second PATCH: status=%d body=%s", r.StatusCode, bodyStr(t, r))
+	}
+
+	body := bodyStr(t, do(t, h, http.MethodGet, ""))
+	for _, want := range []string{"kind-kind-8026", "kind-kind-8027"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("merged kubeconfig missing %q\n\nfull body:\n%s", want, body)
+		}
+	}
+}
+
+// Same context name + same proxy port = same logical upstream. The second
+// PATCH must overwrite the first (the eviction story for "kind delete &&
+// kind create" on the same tunnel — fresh CA, fresh apiserver port, but the
+// daemon ends up with a single entry pointing at the new state).
+func TestKubeconfig_PATCH_SameNameSamePortReplaces(t *testing.T) {
+	h := newTestHandler(t)
+
+	a := proxyKubeconfig("kind-kind", "kind-kind", "user", "https://127.0.0.1:42565", "http://127.0.0.1:8026")
+	b := proxyKubeconfig("kind-kind", "kind-kind", "user", "https://127.0.0.1:37215", "http://127.0.0.1:8026")
+
+	if r := do(t, h, http.MethodPatch, a); r.StatusCode != http.StatusNoContent {
+		t.Fatalf("first PATCH: status=%d body=%s", r.StatusCode, bodyStr(t, r))
+	}
+	if r := do(t, h, http.MethodPatch, b); r.StatusCode != http.StatusNoContent {
+		t.Fatalf("second PATCH: status=%d body=%s", r.StatusCode, bodyStr(t, r))
+	}
+
+	body := bodyStr(t, do(t, h, http.MethodGet, ""))
+	if !strings.Contains(body, "kind-kind-8026") {
+		t.Errorf("missing kind-kind-8026 in: %s", body)
+	}
+	// The newer apiserver port (37215) must win; the stale one (42565) must be gone.
+	if !strings.Contains(body, "37215") {
+		t.Errorf("merged config did not adopt the newer server port 37215:\n%s", body)
+	}
+	if strings.Contains(body, "42565") {
+		t.Errorf("stale server port 42565 still present:\n%s", body)
+	}
+}
+
+// PATCH with the same kubeconfig twice must be idempotent — the suffix must
+// not be re-applied on top of itself.
+func TestKubeconfig_PATCH_Idempotent_WithPortSuffix(t *testing.T) {
+	h := newTestHandler(t)
+	kc := proxyKubeconfig("kind-kind", "kind-kind", "user", "https://127.0.0.1:6443", "http://127.0.0.1:8026")
+
+	for i := 0; i < 3; i++ {
+		if r := do(t, h, http.MethodPatch, kc); r.StatusCode != http.StatusNoContent {
+			t.Fatalf("PATCH iter %d: status=%d body=%s", i, r.StatusCode, bodyStr(t, r))
+		}
+	}
+	body := bodyStr(t, do(t, h, http.MethodGet, ""))
+	if !strings.Contains(body, "kind-kind-8026") {
+		t.Errorf("missing kind-kind-8026 in: %s", body)
+	}
+	// Sanity: the double-suffix form must not appear.
+	if strings.Contains(body, "kind-kind-8026-8026") {
+		t.Errorf("double-suffixed name leaked: %s", body)
 	}
 }
 

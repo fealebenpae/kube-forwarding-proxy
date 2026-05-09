@@ -1,4 +1,12 @@
-// k8s-service-proxy is a Kubernetes service proxy sidecar for Docker Compose stacks.
+// k8s-service-proxy is a Kubernetes service proxy.
+//
+// Subcommands:
+//
+//	k8s-service-proxy             — run the daemon (DNS server by default)
+//	k8s-service-proxy install     — privileged macOS host setup
+//	k8s-service-proxy uninstall   — reverse the install
+//	k8s-service-proxy status      — show install + daemon state
+//	k8s-service-proxy register    — register a kubeconfig with the daemon
 package main
 
 import (
@@ -7,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +28,38 @@ import (
 )
 
 func main() {
+	args := os.Args[1:]
+	sub, rest := splitSubcommand(args)
+
+	switch sub {
+	case "install":
+		os.Exit(runInstall(rest))
+	case "uninstall":
+		os.Exit(runUninstall(rest))
+	case "status":
+		os.Exit(runStatus(rest))
+	case "register":
+		os.Exit(runRegister(rest))
+	default:
+		// No subcommand → daemon. Prepend the unconsumed args back to flag.CommandLine
+		// so `--dns` / `--socks` parse the same as before.
+		os.Args = append([]string{os.Args[0]}, rest...)
+		runDaemon()
+	}
+}
+
+// splitSubcommand returns the first positional argument as the subcommand, and
+// the remaining args (everything before the subcommand-position arg, plus
+// everything after it) for the subcommand to parse. When the first arg starts
+// with "-" or is empty, sub is "" and rest is args unchanged.
+func splitSubcommand(args []string) (sub string, rest []string) {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return "", args
+	}
+	return args[0], args[1:]
+}
+
+func runDaemon() {
 	enableDNS := flag.Bool("dns", false, "Enable DNS server (default when no flags are given)")
 	enableSocks := flag.Bool("socks", false, "Enable SOCKS5 proxy")
 	flag.Parse()

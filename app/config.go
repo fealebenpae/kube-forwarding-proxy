@@ -10,13 +10,12 @@ import (
 
 // Config holds all configuration for the proxy.
 type Config struct {
-	// Interface is the network interface name (e.g. "eth0", "lo0") or IP address
-	// (e.g. "192.168.1.10") to which VIPs are added.
-	// Defaults to the platform loopback interface.
+	// Interface is the network interface name (e.g. "eth0", "lo0") or IP
+	// address (e.g. "192.168.1.10") to which VIPs are added. Defaults to "lo0".
 	Interface string
 
-	// VIPCIDR is the CIDR range for virtual IP allocation (e.g. "127.0.0.0/8").
-	// Defaults to the loopback CIDR.
+	// VIPCIDR is the CIDR range for virtual IP allocation. Defaults to
+	// "127.50.0.0/24" — the same /24 `k8s-service-proxy install` pre-aliases.
 	VIPCIDR string
 
 	// ClusterDomain is the K8s cluster DNS suffix (e.g. "svc.cluster.local").
@@ -25,34 +24,50 @@ type Config struct {
 	// LogLevel controls logging verbosity (debug, info, warn, error).
 	LogLevel string
 
-	// HTTPListen is the address the HTTP server binds to (e.g. "127.0.0.1:8080").
-	// Defaults to "127.0.0.1:8080".
+	// HTTPListen is the address the HTTP server binds to.
+	// Defaults to "127.0.0.1:11616" (the kfp control port).
 	HTTPListen string
 
-	// DNSListen is the address the DNS server binds to (e.g. "127.0.0.1:53").
-	// Defaults to "127.0.0.1:0" (random port on loopback interface).
+	// DNSListen is the address the DNS server binds to. Defaults to
+	// "127.0.0.1:11617" — the same port `k8s-service-proxy install` writes
+	// into /etc/resolver/<cluster-domain>.
 	DNSListen string
 
-	// SOCKSListen is the address the SOCKS5 proxy binds to (e.g. "127.0.0.1:1080").
-	// Defaults to "127.0.0.1:0" (random port on loopback interface).
+	// SOCKSListen is the address the SOCKS5 proxy binds to.
+	// Defaults to "127.0.0.1:11618".
 	SOCKSListen string
 
 	// VIPIdleTimeout is how long a VIP and its port-forward TCP listeners are
 	// kept alive after the last active connection closes and no DNS queries
 	// have refreshed it. Zero (the default) disables idle expiry entirely.
 	VIPIdleTimeout time.Duration
+
+	// VIPAliasMode controls how VIPs are bound to the configured interface.
+	//
+	//	"auto"          — call ifconfig/ip alias for every VIP (default; needs root on macOS).
+	//	"preallocated"  — assume the VIPs are already aliased to the interface;
+	//	                  verify presence and never call ifconfig. Used by the macOS
+	//	                  installer to keep daily operation unprivileged.
+	VIPAliasMode string
 }
 
-// NewConfigFromEnvironment reads configuration from environment variables with sensible defaults.
+// NewConfigFromEnvironment reads configuration from environment variables.
+//
+// Defaults align with what `k8s-service-proxy install` configures so the
+// daemon runs without any env vars on a freshly-installed macOS host. Linux
+// container deployments (e.g. the docker-compose sidecar) set these
+// explicitly; see the README for the override list (VIP_ALIAS_MODE=auto,
+// VIP_CIDR/INTERFACE for the bridge subnet, DNS_LISTEN=:53).
 func NewConfigFromEnvironment() (Config, error) {
 	cfg := Config{
-		Interface:     getEnv("INTERFACE", "127.0.0.1"),
-		VIPCIDR:       getEnv("VIP_CIDR", "127.0.0.0/8"),
+		Interface:     getEnv("INTERFACE", "lo0"),
+		VIPCIDR:       getEnv("VIP_CIDR", "127.50.0.0/24"),
 		ClusterDomain: getEnv("CLUSTER_DOMAIN", "svc.cluster.local"),
 		LogLevel:      strings.ToLower(getEnv("LOG_LEVEL", "info")),
-		HTTPListen:    getEnv("HTTP_LISTEN", "127.0.0.1:8080"),
-		DNSListen:     getEnv("DNS_LISTEN", "127.0.0.1:0"),
-		SOCKSListen:   getEnv("SOCKS_LISTEN", "127.0.0.1:0"),
+		HTTPListen:    getEnv("HTTP_LISTEN", "127.0.0.1:11616"),
+		DNSListen:     getEnv("DNS_LISTEN", "127.0.0.1:11617"),
+		SOCKSListen:   getEnv("SOCKS_LISTEN", "127.0.0.1:11618"),
+		VIPAliasMode:  strings.ToLower(getEnv("VIP_ALIAS_MODE", "preallocated")),
 	}
 
 	if s := os.Getenv("VIP_IDLE_TIMEOUT"); s != "" {
@@ -95,6 +110,12 @@ func (c Config) Validate() error {
 
 	if c.SOCKSListen == "" {
 		return fmt.Errorf("SOCKS_LISTEN must not be empty")
+	}
+
+	switch c.VIPAliasMode {
+	case "", "auto", "preallocated":
+	default:
+		return fmt.Errorf("VIP_ALIAS_MODE must be one of auto, preallocated; got %q", c.VIPAliasMode)
 	}
 
 	return nil

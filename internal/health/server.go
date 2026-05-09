@@ -25,6 +25,11 @@ func (h *Handler) SetReady() {
 	h.ready.Store(true)
 }
 
+// IsReady reports whether SetReady has been called.
+func (h *Handler) IsReady() bool {
+	return h.ready.Load()
+}
+
 func (h *Handler) handleLiveness(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))

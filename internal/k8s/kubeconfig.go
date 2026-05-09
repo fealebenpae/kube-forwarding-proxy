@@ -86,7 +86,7 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := cm.Reset(parsed); err != nil {
+		if err := cm.Reset(RewriteForRegistrant(parsed)); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -104,7 +104,7 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := cm.Add(parsed); err != nil {
+		if err := cm.Add(RewriteForRegistrant(parsed)); err != nil {
 			var conflict *ConflictError
 			if errors.As(err, &conflict) {
 				http.Error(w, err.Error(), http.StatusConflict)
@@ -127,7 +127,7 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := cm.MergeAndOverwrite(parsed); err != nil {
+		if err := cm.MergeAndOverwrite(RewriteForRegistrant(parsed)); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

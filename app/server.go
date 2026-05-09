@@ -4,15 +4,22 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/fealebenpae/kube-forwarding-proxy/internal/api"
+	"github.com/fealebenpae/kube-forwarding-proxy/internal/diagnostics"
 	"github.com/fealebenpae/kube-forwarding-proxy/internal/dns"
 	"github.com/fealebenpae/kube-forwarding-proxy/internal/health"
+	"github.com/fealebenpae/kube-forwarding-proxy/internal/install"
 	"github.com/fealebenpae/kube-forwarding-proxy/internal/k8s"
 	"github.com/fealebenpae/kube-forwarding-proxy/internal/proxy"
 	"github.com/fealebenpae/kube-forwarding-proxy/internal/vip"
@@ -27,6 +34,14 @@ type Server struct {
 	logger      *zap.SugaredLogger
 	enableDNS   bool
 	enableSocks bool
+
+	// startTime is set in NewServer; used by /status to report uptime in
+	// the same `[[dd-]hh:]mm:ss` shape as `ps etime=`.
+	startTime time.Time
+
+	// healthHandler is retained so /status can report the daemon's ready bit
+	// directly (the readyz handler flips ready once Start() finishes).
+	healthHandler *health.Handler
 
 	// Populated after Start() returns successfully.
 	HTTPAddr  string // address the HTTP health server is listening on
@@ -50,6 +65,7 @@ func NewServer(cfg Config, logger *zap.SugaredLogger, enableDNS, enableSocks boo
 		logger:      logger,
 		enableDNS:   enableDNS,
 		enableSocks: enableSocks,
+		startTime:   time.Now(),
 	}
 }
 
@@ -64,8 +80,9 @@ func (s *Server) Start() error {
 
 	// HTTP health / kubeconfig endpoint.
 	mux := http.NewServeMux()
-	healthHandler := health.AddToMux(mux)
+	s.healthHandler = health.AddToMux(mux)
 	kubeconfigHandler := k8s.AddToMux(mux)
+	mux.HandleFunc("/status", s.handleStatus)
 
 	httpLn, err := net.Listen("tcp", s.cfg.HTTPListen)
 	if err != nil {
@@ -88,7 +105,7 @@ func (s *Server) Start() error {
 	}
 
 	// VIP allocator — adds/removes IP aliases on the configured interface.
-	addressManager, err := vip.NewInterfaceAddressManager(ifaceName)
+	addressManager, err := vip.NewInterfaceAddressManager(ifaceName, s.cfg.VIPAliasMode)
 	if err != nil {
 		return fmt.Errorf("creating interface address manager: %w", err)
 	}
@@ -104,6 +121,10 @@ func (s *Server) Start() error {
 	kubeconfigHandler.SetManagers(s.k8sManager, s.forwardManager)
 
 	if s.enableDNS {
+		if msg := diagnostics.CheckResolverPort(s.cfg.ClusterDomain, s.cfg.DNSListen); msg != "" {
+			s.logger.Warn(msg)
+		}
+
 		s.dnsServer = dns.NewServer(
 			s.cfg.DNSListen,
 			s.cfg.ClusterDomain,
@@ -134,13 +155,75 @@ func (s *Server) Start() error {
 		s.SOCKSAddr = s.socks5Proxy.Addr()
 	}
 
-	healthHandler.SetReady()
+	s.healthHandler.SetReady()
 	s.logger.Infow("proxy ready",
 		"http", s.HTTPAddr,
 		"dns", s.DNSAddr,
 		"socks5", s.SOCKSAddr,
 	)
 	return nil
+}
+
+// handleStatus returns the daemon's full runtime status. The default
+// representation is JSON (install state, daemon settings, registered
+// contexts + per-context proxy reachability). `?fmt=text` returns the same
+// data rendered as the human-readable report the `status` subcommand
+// prints. Read-only; safe to expose alongside /healthz and /readyz.
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	settings := api.StatusResponse{
+		Interface:      s.cfg.Interface,
+		VIPCIDR:        s.cfg.VIPCIDR,
+		VIPAliasMode:   s.cfg.VIPAliasMode,
+		VIPIdleTimeout: s.cfg.VIPIdleTimeout.String(),
+		ClusterDomain:  s.cfg.ClusterDomain,
+		LogLevel:       s.cfg.LogLevel,
+		HTTPListen:     s.HTTPAddr,
+		DNSEnabled:     s.enableDNS,
+		DNSListen:      s.DNSAddr,
+		SOCKSEnabled:   s.enableSocks,
+		SOCKSListen:    s.SOCKSAddr,
+	}
+
+	internals := install.ServerInternals{
+		HTTPAddr:  s.HTTPAddr,
+		Settings:  &settings,
+		StartTime: s.startTime,
+		Ready:     s.healthHandler != nil && s.healthHandler.IsReady(),
+		PID:       os.Getpid(),
+		Command:   strings.Join(os.Args, " "),
+	}
+	if s.k8sManager != nil {
+		internals.Kubeconfig = s.k8sManager.Kubeconfig()
+		internals.CurrentContext = s.k8sManager.CurrentContextName()
+	}
+
+	status := install.ComputeStatusForServer(installOptionsFromConfig(s.cfg), internals)
+
+	if r.URL.Query().Get("fmt") == "text" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		status.Print(w)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(status)
+}
+
+// installOptionsFromConfig builds an install.Options describing the install
+// state expected to back this daemon's configuration. Pool size and
+// resolver dir fall back to install defaults — those aren't tracked in
+// app.Config and the status comparison is best-effort either way.
+func installOptionsFromConfig(cfg Config) install.Options {
+	opts := install.Options{
+		ClusterDomain: cfg.ClusterDomain,
+		LoopbackIface: cfg.Interface,
+		PoolCIDR:      cfg.VIPCIDR,
+	}
+	if _, port, err := net.SplitHostPort(cfg.DNSListen); err == nil {
+		if p, err := strconv.Atoi(port); err == nil && p > 0 {
+			opts.DNSPort = p
+		}
+	}
+	return opts.WithDefaults()
 }
 
 // Stop shuts down all components gracefully within the given context deadline.

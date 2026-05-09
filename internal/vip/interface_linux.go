@@ -13,7 +13,10 @@ type netlinkInterfaceAddressManager struct {
 }
 
 // NewInterfaceAddressManager returns an InterfaceAddressManager backed by netlink for the named interface.
-func NewInterfaceAddressManager(iface string) (InterfaceAddressManager, error) {
+// The aliasMode argument is accepted for API parity with the darwin
+// implementation and currently has no effect on Linux.
+func NewInterfaceAddressManager(iface, aliasMode string) (InterfaceAddressManager, error) {
+	_ = aliasMode
 	link, err := netlink.LinkByName(iface)
 	if err != nil {
 		return nil, fmt.Errorf("find interface %s: %w", iface, err)

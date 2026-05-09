@@ -9,7 +9,7 @@ import (
 // restoring their previous values on cleanup.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"INTERFACE", "VIP_CIDR", "CLUSTER_DOMAIN", "LOG_LEVEL", "HTTP_LISTEN", "DNS_LISTEN", "SOCKS_LISTEN"} {
+	for _, k := range []string{"INTERFACE", "VIP_CIDR", "CLUSTER_DOMAIN", "LOG_LEVEL", "HTTP_LISTEN", "DNS_LISTEN", "SOCKS_LISTEN", "VIP_ALIAS_MODE", "VIP_IDLE_TIMEOUT"} {
 		if prev, had := os.LookupEnv(k); had {
 			_ = os.Unsetenv(k)
 			k, prev := k, prev
@@ -20,8 +20,6 @@ func clearEnv(t *testing.T) {
 
 func TestNewConfigFromEnvironment_Defaults(t *testing.T) {
 	clearEnv(t)
-	// Force a known loopback value so the test is deterministic on any platform.
-	t.Setenv("INTERFACE", "lo0")
 
 	cfg, err := NewConfigFromEnvironment()
 	if err != nil {
@@ -30,8 +28,8 @@ func TestNewConfigFromEnvironment_Defaults(t *testing.T) {
 	if cfg.Interface != "lo0" {
 		t.Errorf("Interface = %q, want lo0", cfg.Interface)
 	}
-	if cfg.VIPCIDR != "127.0.0.0/8" {
-		t.Errorf("VIPCIDR = %q, want 127.0.0.0/8", cfg.VIPCIDR)
+	if cfg.VIPCIDR != "127.50.0.0/24" {
+		t.Errorf("VIPCIDR = %q, want 127.50.0.0/24", cfg.VIPCIDR)
 	}
 	if cfg.ClusterDomain != "svc.cluster.local" {
 		t.Errorf("ClusterDomain = %q, want svc.cluster.local", cfg.ClusterDomain)
@@ -39,14 +37,17 @@ func TestNewConfigFromEnvironment_Defaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want info", cfg.LogLevel)
 	}
-	if cfg.HTTPListen != "127.0.0.1:8080" {
-		t.Errorf("HTTPListen = %q, want 127.0.0.1:8080", cfg.HTTPListen)
+	if cfg.HTTPListen != "127.0.0.1:11616" {
+		t.Errorf("HTTPListen = %q, want 127.0.0.1:11616", cfg.HTTPListen)
 	}
-	if cfg.DNSListen != "127.0.0.1:0" {
-		t.Errorf("DNSListen = %q, want 127.0.0.1:0", cfg.DNSListen)
+	if cfg.DNSListen != "127.0.0.1:11617" {
+		t.Errorf("DNSListen = %q, want 127.0.0.1:11617", cfg.DNSListen)
 	}
-	if cfg.SOCKSListen != "127.0.0.1:0" {
-		t.Errorf("SOCKSListen = %q, want 127.0.0.1:0", cfg.SOCKSListen)
+	if cfg.SOCKSListen != "127.0.0.1:11618" {
+		t.Errorf("SOCKSListen = %q, want 127.0.0.1:11618", cfg.SOCKSListen)
+	}
+	if cfg.VIPAliasMode != "preallocated" {
+		t.Errorf("VIPAliasMode = %q, want preallocated", cfg.VIPAliasMode)
 	}
 }
 
