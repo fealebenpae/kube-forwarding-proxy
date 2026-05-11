@@ -289,9 +289,10 @@ Defaults:
 | VIP CIDR | `127.50.0.0/24` | Loopback subnet aliased to `lo0`. |
 | Pool size | `255` | `127.50.0.1`–`127.50.0.255`. On loopback no L2 broadcast applies, so the `.255` address is fine to alias and use. One VIP per concurrent unique `(context, namespace, service[, pod])` tuple. |
 
-**Reboot persistence.** `ifconfig` aliases on macOS live in kernel memory only —
-they vanish on reboot. Re-run `./k8s-service-proxy install` after each reboot
-(it is idempotent, ~1–2 s) or wire it into a login item.
+**Reboot.** `ifconfig` aliases on macOS live in kernel memory only and vanish
+on reboot; the binary does not install any launch agent / login item to
+restore them. Re-run `./k8s-service-proxy install` after each reboot
+(idempotent, ~1–2 s).
 
 ### Run the daemon
 
