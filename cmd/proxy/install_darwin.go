@@ -28,7 +28,7 @@ func runInstall(args []string) int {
 	plan.PrintWhat(os.Stdout)
 	if plan.IsEmpty() {
 		fmt.Println()
-		install.ComputeStatus(opts, defaultDaemonHTTP).Print(os.Stdout)
+		install.ComputeStatus(opts, defaultDaemonHTTP).Print(os.Stdout, opts)
 		return 0
 	}
 	if os.Geteuid() != 0 {
@@ -43,7 +43,7 @@ func runInstall(args []string) int {
 		return 1
 	}
 	fmt.Println()
-	install.ComputeStatus(opts, defaultDaemonHTTP).Print(os.Stdout)
+	install.ComputeStatus(opts, defaultDaemonHTTP).Print(os.Stdout, opts)
 	return 0
 }
 
@@ -78,7 +78,7 @@ func runStatus(args []string) int {
 		fmt.Fprintf(os.Stderr, "invalid arguments: %v\n", err)
 		return 2
 	}
-	install.ComputeStatus(opts, *daemonHTTP).Print(os.Stdout)
+	install.ComputeStatus(opts, *daemonHTTP).Print(os.Stdout, opts)
 	return 0
 }
 

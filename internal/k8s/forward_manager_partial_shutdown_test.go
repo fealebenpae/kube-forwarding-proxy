@@ -160,10 +160,10 @@ func TestSplitEntryKey(t *testing.T) {
 	}{
 		{"ctx-a/127.50.0.1:8080", "ctx-a", "127.50.0.1", true},
 		{"kind-kind-8030/127.50.0.5:27017", "kind-kind-8030", "127.50.0.5", true},
-		// IPv6 VIPs aren't currently used but the parser should still
-		// degrade gracefully on a non-conforming key — LastIndexByte
-		// finds the last colon.
-		{"ctx/[::1]:80", "ctx", "[::1]", true},
+		// IPv6 VIPs aren't currently used but net.SplitHostPort still parses
+		// the bracketed form and strips brackets, yielding a value
+		// net.ParseIP accepts.
+		{"ctx/[::1]:80", "ctx", "::1", true},
 		{"no-slash", "", "", false},
 		{"ctx/no-port", "", "", false},
 	}

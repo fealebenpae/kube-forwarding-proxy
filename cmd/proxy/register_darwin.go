@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"sort"
-	"strings"
 	"time"
 
 	"k8s.io/client-go/tools/clientcmd"
@@ -88,24 +87,13 @@ func runRegister(args []string) int {
 	}
 
 	// Preview the names the daemon keys entries by — the registrant rewrite
-	// suffixes each context/cluster/user with the cluster's proxy-url port
-	// so contexts from different worktrees (different tunnel ports) stay
-	// independently addressable. Re-registering the same context name on
-	// the same tunnel port overwrites the previous entry in place.
-	// When no proxy-url is set, the rewrite is a no-op and
-	// submitted == registered.
+	// suffixes each context/cluster/user with the cluster's proxy-url port.
+	// When no proxy-url is set, submitted == registered.
+	nameMap := k8s.ContextNameMap(cfg)
 	type pair struct{ submitted, registered string }
-	pairs := make([]pair, 0, len(cfg.Contexts))
-	for name, ctx := range cfg.Contexts {
-		registered := name
-		if ctx != nil {
-			if cluster, ok := cfg.Clusters[ctx.Cluster]; ok {
-				if s := k8s.DerivePortSuffix(cluster); s != "" && !strings.HasSuffix(name, "-"+s) {
-					registered = name + "-" + s
-				}
-			}
-		}
-		pairs = append(pairs, pair{name, registered})
+	pairs := make([]pair, 0, len(nameMap))
+	for submitted, registered := range nameMap {
+		pairs = append(pairs, pair{submitted, registered})
 	}
 	sort.Slice(pairs, func(i, j int) bool { return pairs[i].submitted < pairs[j].submitted })
 
@@ -121,6 +109,6 @@ func runRegister(args []string) int {
 	fmt.Println()
 
 	opts := install.Options{}.WithDefaults()
-	install.ComputeStatus(opts, *daemonHTTP).Print(os.Stdout)
+	install.ComputeStatus(opts, *daemonHTTP).Print(os.Stdout, opts)
 	return 0
 }

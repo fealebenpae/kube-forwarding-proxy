@@ -263,7 +263,7 @@ go build -o k8s-service-proxy ./cmd/proxy
                                     # with "already up to date" + status report
 ./k8s-service-proxy status          # check install + daemon state any time
 
-./k8s-service-proxy install --pool-size 64    # plan a smaller pool
+./k8s-service-proxy install --pool-size 128   # plan a larger pool
 ./k8s-service-proxy install --dns-port 5354   # plan a different DNS port
 ./k8s-service-proxy uninstall                 # reverse the install
 ./k8s-service-proxy install --help            # full flag list
@@ -286,7 +286,7 @@ Defaults:
 | Cluster domain | `svc.cluster.local` | `install` writes `/etc/resolver/<domain>`; macOS longest-suffix match still lets you carve sub-domains later. |
 | DNS port | `11617` | Where the daemon listens; macOS resolver routes `*.<cluster-domain>` queries here. |
 | VIP CIDR | `127.50.0.0/24` | Loopback subnet aliased to `lo0`. |
-| Pool size | `255` | `127.50.0.1`–`127.50.0.255`. On loopback no L2 broadcast applies, so the `.255` address is fine to alias and use. One VIP per concurrent unique `(context, namespace, service[, pod])` tuple. |
+| Pool size | `64` | `127.50.0.1`–`127.50.0.64`. One VIP per concurrent unique `(context, namespace, service[, pod])` tuple. Grow with `--pool-size` (max 255 in a `/24`). |
 
 **Reboot.** `ifconfig` aliases on macOS live in kernel memory only and vanish
 on reboot; the binary does not install any launch agent / login item to
@@ -323,9 +323,9 @@ exhaust the pool, re-run the installer with a larger `--pool-size` (and
 optionally set `VIP_IDLE_TIMEOUT` so unused VIPs return to the pool).
 
 Pod-level addressing (`<pod>.<svc>.<ns>.svc.cluster.local`) allocates a separate
-VIP per pod, so a 30-pod sharded workload consumes 30 VIPs from the pool. The
-default `/24` (255 usable) covers ~8 such workloads concurrently across every
-registered context combined.
+VIP per pod, so an N-pod workload consumes N VIPs from the pool. Size the pool
+for the sum of concurrent unique service+pod combinations across every
+registered context.
 
 The SOCKS5 mode (see [SOCKS5 Proxy](#socks5-proxy-alternative)) uses no VIPs at
 all — the client tells the proxy the destination hostname, so name-based
@@ -344,34 +344,35 @@ kubeconfig fragment so the daemon tunnels each context's API + SPDY traffic
 through the right path. Any scheme `client-go` accepts works (`http://`,
 `https://`, `socks5://`).
 
-Name collisions across registrants — e.g. parallel devcontainers that all use
-the kind-default context name `kind-kind` — are handled server-side. On every
-PUT/POST/PATCH the daemon suffixes every cluster, context, and auth-info name
-with the cluster's `proxy-url` port before merge. Each worktree runs its own
-SOCKS/HTTP-CONNECT tunnel on a distinct local port, so `kind-kind` from a
-worktree on `:8026` becomes `kind-kind-8026` and the same name from a worktree
-on `:8027` becomes `kind-kind-8027` — both stay addressable. Identity is
-`(original-name, proxy-port)`: re-registering the same tuple PATCH-overwrites
-the previous entry, which is the eviction story when a kind cluster gets
-recreated under the same tunnel (fresh CA, fresh apiserver port, single entry).
-Configs whose clusters have no `proxy-url` pass through unchanged, preserving
-the legacy overwrite behaviour for simple single-cluster setups. The rewrite
-is idempotent — already-suffixed names are a no-op.
+Name collisions across registrants — e.g. multiple parallel registrants whose
+kubeconfigs share a context name (a common case when tools default to a fixed
+name like `kind-kind`) — are handled server-side. On every PUT/POST/PATCH the
+daemon suffixes every cluster, context, and auth-info name with the cluster's
+`proxy-url` port before merge. Each registrant runs its own SOCKS / HTTP-CONNECT
+tunnel on a distinct local port, so `kind-kind` from a registrant on `:8026`
+becomes `kind-kind-8026` and the same name from a registrant on `:8027` becomes
+`kind-kind-8027` — both stay addressable. Identity is `(original-name,
+proxy-port)`: re-registering the same tuple PATCH-overwrites the previous
+entry, which is the eviction story when an upstream is recreated under the
+same tunnel (fresh CA, fresh apiserver port, single entry). Configs whose
+clusters have no `proxy-url` pass through unchanged, preserving the legacy
+overwrite behaviour for simple single-cluster setups. The rewrite is
+idempotent — already-suffixed names are a no-op.
 
 Example fragment a registrant `PATCH`es:
 
 ```yaml
 clusters:
-  - name: wt-22-evg
+  - name: wt-22
     cluster:
       server: https://127.0.0.1:6443
       proxy-url: socks5://127.0.0.1:1081
       certificate-authority-data: ...
 contexts:
-  - name: wt-22-evg
-    context: { cluster: wt-22-evg, user: wt-22-evg }
+  - name: wt-22
+    context: { cluster: wt-22, user: wt-22 }
 users:
-  - name: wt-22-evg
+  - name: wt-22
     user: { client-certificate-data: ..., client-key-data: ... }
 ```
 

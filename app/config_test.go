@@ -140,7 +140,6 @@ func TestValidate_EmptyFields(t *testing.T) {
 		cfg  Config
 	}{
 		{"empty Interface", func() Config { c := base; c.Interface = ""; return c }()},
-		{"empty ClusterDomain", func() Config { c := base; c.ClusterDomain = ""; return c }()},
 		{"empty DNSListen", func() Config { c := base; c.DNSListen = ""; return c }()},
 		{"empty SOCKSListen", func() Config { c := base; c.SOCKSListen = ""; return c }()},
 	}

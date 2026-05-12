@@ -100,10 +100,6 @@ func (c Config) Validate() error {
 		return fmt.Errorf("VIP_CIDR is not a valid CIDR: %w", err)
 	}
 
-	if c.ClusterDomain == "" {
-		return fmt.Errorf("ClusterDomain must not be empty")
-	}
-
 	validLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLevels[c.LogLevel] {
 		return fmt.Errorf("LOG_LEVEL must be one of debug, info, warn, error; got %q", c.LogLevel)

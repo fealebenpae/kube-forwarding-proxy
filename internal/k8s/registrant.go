@@ -10,23 +10,9 @@ import (
 )
 
 // DerivePortSuffix returns the port from a cluster's proxy-url, or "" when
-// no proxy-url is set or the URL is unparseable. Used by RewriteForRegistrant
-// to suffix cluster, context, and auth-info names so different worktrees —
-// each with its own SOCKS/HTTP-CONNECT tunnel on a distinct local port —
-// stay independently addressable even when their kubeconfig context names
-// happen to match (e.g. every kind cluster's context is "kind-kind").
-//
-// Identity is `(original-name, proxy-port)`. Re-registering the same tuple
-// PATCH-overwrites the previous entry — that's the eviction story when a
-// kind cluster gets recreated under the same tunnel: same name+port, fresh
-// CA, single entry. Different ports keep both entries because they
-// represent different tunnels (and therefore different upstream hosts).
-//
-// When proxy-url has no explicit port the scheme's default is used:
-// http→80, https→443, socks5/socks5h→1080.
-//
-// Exported so the `register` subcommand can preview the rename without
-// re-parsing the daemon's response.
+// no proxy-url is set or the URL is unparseable. When proxy-url has no
+// explicit port the scheme's default is used: http→80, https→443,
+// socks5/socks5h→1080.
 func DerivePortSuffix(cluster *clientcmdapi.Cluster) string {
 	if cluster == nil || cluster.ProxyURL == "" {
 		return ""
@@ -63,23 +49,31 @@ func withSuffix(id, name string) string {
 	return name + s
 }
 
+// ContextNameMap returns submitted-name -> registered-name for every context
+// in cfg, applying the same suffixing rules as RewriteForRegistrant. Used by
+// the `register` subcommand to preview the rename without round-tripping the
+// full rewrite output.
+func ContextNameMap(cfg *clientcmdapi.Config) map[string]string {
+	if cfg == nil {
+		return nil
+	}
+	out := make(map[string]string, len(cfg.Contexts))
+	for name, ctx := range cfg.Contexts {
+		registered := name
+		if ctx != nil {
+			registered = withSuffix(DerivePortSuffix(cfg.Clusters[ctx.Cluster]), name)
+		}
+		out[name] = registered
+	}
+	return out
+}
+
 // RewriteForRegistrant returns a copy of cfg with cluster, context, and
 // auth-info names suffixed by their cluster's proxy-url port. Cross-references
-// inside contexts are rewritten to the new names; CurrentContext is rewritten
-// too.
-//
-// The rewrite is the daemon's safeguard against name collisions when
-// multiple registrants (different worktrees, parallel devcontainers) PATCH
-// kubeconfigs whose context names happen to be identical. Every worktree
-// gets its own tunnel port → its own suffix → independently addressable.
-// Re-registering the same context name on the same tunnel overwrites the
-// previous entry in place (built into kubeconfig PATCH semantics).
-//
-// Configs whose clusters have no proxy-url pass through unchanged,
-// preserving the legacy overwrite-on-PATCH behaviour for simple
-// single-cluster setups (e.g. a real KUBECONFIG file with a stable name).
-//
-// Idempotent: re-running on already-suffixed names is a no-op.
+// (and CurrentContext) are rewritten to the new names. Identity becomes
+// (original-name, proxy-port): different ports stay independently
+// addressable; same name+port PATCH-overwrites. Clusters without a
+// proxy-url pass through unchanged. Idempotent.
 func RewriteForRegistrant(cfg *clientcmdapi.Config) *clientcmdapi.Config {
 	if cfg == nil {
 		return nil

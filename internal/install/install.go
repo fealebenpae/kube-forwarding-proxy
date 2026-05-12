@@ -18,7 +18,7 @@ const (
 	DefaultClusterDomain = "svc.cluster.local"
 	DefaultDNSPort       = 11617
 	DefaultPoolCIDR      = "127.50.0.0/24"
-	DefaultPoolSize      = 255
+	DefaultPoolSize      = 64
 	DefaultLoopbackIface = "lo0"
 	DefaultResolverDir   = "/etc/resolver"
 )

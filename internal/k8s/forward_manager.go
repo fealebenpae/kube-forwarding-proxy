@@ -19,9 +19,8 @@ import (
 	"k8s.io/client-go/transport/spdy"
 )
 
-// VIPReleaser is satisfied by vip.Allocator and allows ForwardManager to
-// release a single VIP from the network interface without importing the vip
-// package (which would create a circular dependency).
+// VIPReleaser releases a single VIP from the network interface. Satisfied by
+// *vip.Allocator; kept as an interface to avoid a circular import.
 type VIPReleaser interface {
 	ReleaseVIP(ip net.IP) error
 }
@@ -32,9 +31,9 @@ type forwardEntry struct {
 	cancel   context.CancelFunc
 }
 
-// vipState tracks idle-expiry state for a single virtual IP address. All
-// fields except activeConns are protected by mu. activeConns is always
-// accessed atomically.
+// vipState tracks idle-expiry state for a single virtual IP address.
+// timer and generation are protected by mu; activeConns is atomic;
+// forwardKeys is protected by the enclosing ForwardManager.mu.
 type vipState struct {
 	mu          sync.Mutex
 	timer       *time.Timer // nil when idleTimeout is zero
@@ -53,21 +52,12 @@ type poolEntry struct {
 	refs   atomic.Int32
 }
 
-// ForwardManager manages TCP listeners bound to virtual IP addresses. Each
-// contextName/vip:svcPort triple gets one net.Listener. For every inbound TCP
-// connection a fresh SPDY session is opened to the Kubernetes API server,
-// targeting a randomly chosen pod endpoint, so load is distributed across all
-// healthy pods on a per-connection basis.
-//
-// SPDY connections are pooled per (contextName, namespace, podName): multiple
-// concurrent port-forwards to the same pod share one underlying TCP connection
-// to the API server. Reference counting drives connection lifetime — the last
-// streamConn to close triggers eviction.
-//
-// When vipReleaser is non-nil and idleTimeout is positive, each VIP's TCP
-// listeners are automatically torn down and the VIP is released after the
-// configured idle period elapses with no active TCP connections. DNS re-queries
-// reset the timer via TouchVIP; active connections pause it.
+// ForwardManager owns one TCP listener per (context, vip, svcPort). Inbound
+// connections open a SPDY portforward to a random backing pod; SPDY
+// connections are pooled per (context, namespace, pod) and reference-counted.
+// When vipReleaser != nil and idleTimeout > 0 a VIP's listeners are torn down
+// and the VIP released after idleTimeout with no active connections; DNS
+// re-queries reset the timer via TouchVIP.
 type ForwardManager struct {
 	clients     *ClientManager
 	resolver    *Resolver
@@ -85,9 +75,8 @@ type ForwardManager struct {
 	spdyPool   map[string]*poolEntry // "contextName/namespace/podName" -> entry
 }
 
-// NewForwardManager creates a new ForwardManager.
-// vipReleaser and idleTimeout activate idle-expiry behaviour: pass nil/0 to
-// disable it entirely and preserve the previous always-on semantics.
+// NewForwardManager creates a new ForwardManager. Pass vipReleaser=nil or
+// idleTimeout=0 to disable idle-expiry entirely.
 func NewForwardManager(clients *ClientManager, resolver *Resolver, logger *zap.SugaredLogger, vipReleaser VIPReleaser, idleTimeout time.Duration) *ForwardManager {
 	return &ForwardManager{
 		clients:     clients,
@@ -102,14 +91,9 @@ func NewForwardManager(clients *ClientManager, resolver *Resolver, logger *zap.S
 }
 
 // StartForward ensures a TCP listener is running on vipAddr:svcPort for the
-// given Kubernetes service in contextName. When contextName is empty the
-// current-context of the merged kubeconfig is used. Idempotent: a second call
-// for the same contextName/vipAddr/svcPort resets the idle timer and returns
-// nil without starting a new listener.
-//
-// The listener is bound synchronously before StartForward returns, so callers
-// can connect immediately. Each accepted TCP connection independently resolves
-// a random pod endpoint and opens its own SPDY portforward session to that pod.
+// named service. Empty contextName falls back to the current-context.
+// Idempotent: a duplicate call resets the idle timer and returns nil. The
+// listener is bound before returning, so callers can connect immediately.
 func (m *ForwardManager) StartForward(_ context.Context, contextName, vipAddr string, svcPort int32, namespace, svcName, podName string) error {
 	if contextName == "" {
 		contextName = m.clients.CurrentContextName()
@@ -168,11 +152,9 @@ func (m *ForwardManager) StartForward(_ context.Context, contextName, vipAddr st
 	return nil
 }
 
-// touchVIPLocked resets the idle timer for vipAddr. It must be called while
-// holding m.mu. It is a no-op when idle expiry is disabled or the VIP has no
-// tracked state. The timer is not re-armed while active connections are
-// present; handleConn's deferred cleanup re-arms it when the last connection
-// closes.
+// touchVIPLocked resets the idle timer for vipAddr. Caller must hold m.mu.
+// No-op when idle expiry is disabled or active connections exist (handleConn
+// re-arms the timer when the last connection drops).
 func (m *ForwardManager) touchVIPLocked(vipAddr string) {
 	if m.idleTimeout == 0 || m.vipReleaser == nil {
 		return
@@ -198,20 +180,17 @@ func (m *ForwardManager) touchVIPLocked(vipAddr string) {
 	})
 }
 
-// TouchVIP resets the idle timer for vipAddr. It is safe to call concurrently.
-// Callers (e.g. the DNS server) should call this whenever a DNS query resolves
-// to an already-allocated VIP, to keep the VIP alive as long as it is being
-// actively queried.
+// TouchVIP resets the idle timer for vipAddr. Safe to call concurrently.
+// Callers should invoke it on every DNS hit to an already-allocated VIP.
 func (m *ForwardManager) TouchVIP(vipAddr string) {
 	m.mu.Lock()
 	m.touchVIPLocked(vipAddr)
 	m.mu.Unlock()
 }
 
-// expireVIP is called by the idle timer goroutine. It cancels all port-forward
-// listeners for vipAddr and releases the VIP from the interface. The gen
-// parameter is matched against the current generation in vipState to detect
-// stale timer firings (e.g. after TouchVIP reset the timer).
+// expireVIP, invoked by the idle-timer goroutine, cancels every listener on
+// vipAddr and releases the VIP. gen guards against stale firings after
+// TouchVIP re-armed the timer.
 func (m *ForwardManager) expireVIP(vipAddr string, gen uint64) {
 	m.mu.Lock()
 	state, ok := m.vipStates[vipAddr]
@@ -411,20 +390,10 @@ func (m *ForwardManager) buildOnClose(poolKey string, e *poolEntry) func() {
 	}
 }
 
-// DialPortForward resolves a random pod endpoint for the given service, opens a
-// (possibly pooled) SPDY portforward stream to that pod, and returns a net.Conn
-// backed by the SPDY data stream. The caller owns the returned connection and
-// must close it when done; closing it decrements the pool reference count.
-//
-// SPDY connections are pooled per (contextName, namespace, podName) so that
-// concurrent dials to the same pod share one underlying TCP connection to the
-// API server rather than opening a new one for every call.
-//
-// This is a one-shot dial: unlike StartForward it does not create a persistent
-// TCP listener and does not allocate a virtual IP. It is intended for callers
-// (e.g. the SOCKS5 proxy) that already hold a client connection and want to
-// stream bytes directly through the Kubernetes portforward API without any
-// intermediate hop.
+// DialPortForward resolves a random pod backing the service and returns a
+// net.Conn over a (possibly pooled) SPDY portforward stream to that pod.
+// One-shot: it does not create a TCP listener or allocate a VIP. Closing
+// the returned conn decrements the pool reference count.
 func (m *ForwardManager) DialPortForward(ctx context.Context, contextName, namespace, svcName, podName string, svcPort int32) (net.Conn, error) {
 	if contextName == "" {
 		contextName = m.clients.CurrentContextName()
@@ -534,15 +503,9 @@ func (m *ForwardManager) Shutdown() {
 	m.spdyPoolMu.Unlock()
 }
 
-// ShutdownForContexts closes port-forward listeners belonging to the named
-// kubeconfig contexts and drops their pooled SPDY connections. Listeners
-// for contexts not in the list keep running, so concurrent worktrees
-// sharing the daemon can re-register their own kubeconfig without
-// disrupting each other's in-flight connections.
-//
-// VIPs are released only when every listener bound to them is torn down by
-// this call — a VIP that still has a surviving listener (e.g. a service of
-// the same name in a peer context) stays allocated.
+// ShutdownForContexts closes listeners + pooled SPDY connections only for
+// the named contexts; unrelated contexts keep running. A VIP is released
+// only once every listener bound to it has been torn down by this call.
 func (m *ForwardManager) ShutdownForContexts(names []string) {
 	if len(names) == 0 {
 		return
@@ -634,12 +597,11 @@ func splitEntryKey(key string) (ctxName, vipAddr string, ok bool) {
 	if slash < 0 {
 		return "", "", false
 	}
-	rest := key[slash+1:]
-	colon := strings.LastIndexByte(rest, ':')
-	if colon < 0 {
+	host, _, err := net.SplitHostPort(key[slash+1:])
+	if err != nil {
 		return "", "", false
 	}
-	return key[:slash], rest[:colon], true
+	return key[:slash], host, true
 }
 
 type portForwardStreams struct {

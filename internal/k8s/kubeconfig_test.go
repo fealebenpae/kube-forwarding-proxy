@@ -333,10 +333,10 @@ func TestKubeconfig_RoundTrip_PutThenGet(t *testing.T) {
 
 // --- Registrant suffixing by proxy port ---
 
-// Two registrants from different worktrees PATCH the same kubeconfig context
-// name (the canonical "kind-kind" case) but their proxy-urls have different
-// ports — different tunnels into different EVG hosts. The daemon must keep
-// both registrations addressable rather than overwriting one with the other.
+// Two registrants PATCH the same kubeconfig context name (the canonical
+// "kind-kind" case) but their proxy-urls have different ports — different
+// tunnels into different upstream hosts. The daemon must keep both
+// registrations addressable rather than overwriting one with the other.
 func TestKubeconfig_PATCH_DifferentProxyPortsCoexist(t *testing.T) {
 	h := newTestHandler(t)
 

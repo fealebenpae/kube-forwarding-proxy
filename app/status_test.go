@@ -103,11 +103,11 @@ func TestHandleStatus_DefaultJSON(t *testing.T) {
 	}
 	// PoolFirst/Last should be filled from PoolIPs computation regardless
 	// of whether the test host actually has lo0 aliased.
-	if s.PoolFirst != "127.50.0.1" || s.PoolLast != "127.50.0.255" {
-		t.Errorf("Pool range = %s..%s, want 127.50.0.1..127.50.0.255", s.PoolFirst, s.PoolLast)
+	if s.PoolFirst != "127.50.0.1" || s.PoolLast != "127.50.0.64" {
+		t.Errorf("Pool range = %s..%s, want 127.50.0.1..127.50.0.64", s.PoolFirst, s.PoolLast)
 	}
-	if s.PoolTotal != 255 {
-		t.Errorf("PoolTotal = %d, want 255", s.PoolTotal)
+	if s.PoolTotal != 64 {
+		t.Errorf("PoolTotal = %d, want 64", s.PoolTotal)
 	}
 	if len(s.Contexts) != 0 {
 		t.Errorf("Contexts non-empty for a fresh ClientManager: %v", s.Contexts)

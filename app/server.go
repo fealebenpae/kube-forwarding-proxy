@@ -188,7 +188,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		HTTPAddr:  s.HTTPAddr,
 		Settings:  &settings,
 		StartTime: s.startTime,
-		Ready:     s.healthHandler != nil && s.healthHandler.IsReady(),
+		Ready:     s.healthHandler.IsReady(),
 		PID:       os.Getpid(),
 		Command:   strings.Join(os.Args, " "),
 	}
@@ -197,11 +197,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		internals.CurrentContext = s.k8sManager.CurrentContextName()
 	}
 
-	status := install.ComputeStatusForServer(installOptionsFromConfig(s.cfg), internals)
+	opts := installOptionsFromConfig(s.cfg)
+	status := install.ComputeStatusForServer(opts, internals)
 
 	if r.URL.Query().Get("fmt") == "text" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		status.Print(w)
+		status.Print(w, opts)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
