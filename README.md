@@ -44,7 +44,6 @@ All configuration is via environment variables:
 | `KUBECONFIG` | `/root/.kube/config` | Path to kubeconfig file |
 | `INTERFACE` | `lo0` | Interface name (e.g. `eth0`) or IP address the DNS/SOCKS servers bind to. VIPs are also added to this interface. |
 | `VIP_CIDR` | `127.50.0.0/24` | CIDR range for virtual IPs |
-| `CLUSTER_DOMAIN` | `svc.cluster.local` | Kubernetes cluster domain |
 | `LOG_LEVEL` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `HTTP_LISTEN` | `127.0.0.1:11616` | Control server listen address |
 | `DNS_LISTEN` | `127.0.0.1:11617` | DNS server listen address |

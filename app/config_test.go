@@ -9,7 +9,7 @@ import (
 // restoring their previous values on cleanup.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"INTERFACE", "VIP_CIDR", "CLUSTER_DOMAIN", "LOG_LEVEL", "HTTP_LISTEN", "DNS_LISTEN", "SOCKS_LISTEN", "VIP_ALIAS_MODE", "VIP_IDLE_TIMEOUT"} {
+	for _, k := range []string{"INTERFACE", "VIP_CIDR", "LOG_LEVEL", "HTTP_LISTEN", "DNS_LISTEN", "SOCKS_LISTEN", "VIP_ALIAS_MODE", "VIP_IDLE_TIMEOUT"} {
 		if prev, had := os.LookupEnv(k); had {
 			_ = os.Unsetenv(k)
 			k, prev := k, prev
@@ -55,7 +55,6 @@ func TestNewConfigFromEnvironment_FromEnv(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("INTERFACE", "eth0")
 	t.Setenv("VIP_CIDR", "10.99.0.0/16")
-	t.Setenv("CLUSTER_DOMAIN", "cluster.local")
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("HTTP_LISTEN", ":9090")
 	t.Setenv("DNS_LISTEN", ":5353")
@@ -71,9 +70,6 @@ func TestNewConfigFromEnvironment_FromEnv(t *testing.T) {
 	if cfg.VIPCIDR != "10.99.0.0/16" {
 		t.Errorf("VIPCIDR = %q, want 10.99.0.0/16", cfg.VIPCIDR)
 	}
-	if cfg.ClusterDomain != "cluster.local" {
-		t.Errorf("ClusterDomain = %q, want cluster.local", cfg.ClusterDomain)
-	}
 	if cfg.LogLevel != "debug" {
 		t.Errorf("LogLevel = %q, want debug", cfg.LogLevel)
 	}
@@ -82,6 +78,20 @@ func TestNewConfigFromEnvironment_FromEnv(t *testing.T) {
 	}
 	if cfg.SOCKSListen != ":1080" {
 		t.Errorf("SOCKSListen = %q, want :1080", cfg.SOCKSListen)
+	}
+}
+
+// ClusterDomain is no longer read from CLUSTER_DOMAIN env; verify the
+// var is ignored even when set to a conflicting value.
+func TestNewConfigFromEnvironment_IgnoresClusterDomainEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("CLUSTER_DOMAIN", "cluster.local")
+	cfg, err := NewConfigFromEnvironment()
+	if err != nil {
+		t.Fatalf("NewConfigFromEnvironment() failed: %v", err)
+	}
+	if cfg.ClusterDomain != "svc.cluster.local" {
+		t.Errorf("ClusterDomain = %q, want svc.cluster.local (env should be ignored)", cfg.ClusterDomain)
 	}
 }
 

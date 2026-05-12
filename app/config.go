@@ -18,7 +18,12 @@ type Config struct {
 	// "127.50.0.0/24" — the same /24 `k8s-service-proxy install` pre-aliases.
 	VIPCIDR string
 
-	// ClusterDomain is the K8s cluster DNS suffix (e.g. "svc.cluster.local").
+	// ClusterDomain is the K8s service DNS suffix. Hardcoded to
+	// "svc.cluster.local" — the universal Kubernetes default. We intentionally
+	// don't read a CLUSTER_DOMAIN env var because the same name is used by
+	// downstream toolchains (e.g. kind / Helm) to mean the cluster's *base*
+	// domain ("cluster.local") rather than the service suffix kfp needs;
+	// inheriting that value silently breaks DNS name parsing.
 	ClusterDomain string
 
 	// LogLevel controls logging verbosity (debug, info, warn, error).
@@ -62,7 +67,7 @@ func NewConfigFromEnvironment() (Config, error) {
 	cfg := Config{
 		Interface:     getEnv("INTERFACE", "lo0"),
 		VIPCIDR:       getEnv("VIP_CIDR", "127.50.0.0/24"),
-		ClusterDomain: getEnv("CLUSTER_DOMAIN", "svc.cluster.local"),
+		ClusterDomain: "svc.cluster.local",
 		LogLevel:      strings.ToLower(getEnv("LOG_LEVEL", "info")),
 		HTTPListen:    getEnv("HTTP_LISTEN", "127.0.0.1:11616"),
 		DNSListen:     getEnv("DNS_LISTEN", "127.0.0.1:11617"),
@@ -96,7 +101,7 @@ func (c Config) Validate() error {
 	}
 
 	if c.ClusterDomain == "" {
-		return fmt.Errorf("CLUSTER_DOMAIN must not be empty")
+		return fmt.Errorf("ClusterDomain must not be empty")
 	}
 
 	validLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
