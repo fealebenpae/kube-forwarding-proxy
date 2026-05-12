@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -531,6 +532,114 @@ func (m *ForwardManager) Shutdown() {
 		delete(m.spdyPool, key)
 	}
 	m.spdyPoolMu.Unlock()
+}
+
+// ShutdownForContexts closes port-forward listeners belonging to the named
+// kubeconfig contexts and drops their pooled SPDY connections. Listeners
+// for contexts not in the list keep running, so concurrent worktrees
+// sharing the daemon can re-register their own kubeconfig without
+// disrupting each other's in-flight connections.
+//
+// VIPs are released only when every listener bound to them is torn down by
+// this call — a VIP that still has a surviving listener (e.g. a service of
+// the same name in a peer context) stays allocated.
+func (m *ForwardManager) ShutdownForContexts(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	flush := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		if n != "" {
+			flush[n] = struct{}{}
+		}
+	}
+	if len(flush) == 0 {
+		return
+	}
+
+	var vipsToRelease []net.IP
+	m.mu.Lock()
+	touchedVIPs := make(map[string]struct{})
+	for key, entry := range m.entries {
+		ctxName, vipAddr, ok := splitEntryKey(key)
+		if !ok {
+			continue
+		}
+		if _, hit := flush[ctxName]; !hit {
+			continue
+		}
+		m.logger.Infow("stopping per-context port-forward listener", "key", key)
+		entry.cancel()
+		_ = entry.listener.Close()
+		delete(m.entries, key)
+		touchedVIPs[vipAddr] = struct{}{}
+	}
+	for vipAddr := range touchedVIPs {
+		state, ok := m.vipStates[vipAddr]
+		if !ok {
+			continue
+		}
+		surviving := state.forwardKeys[:0]
+		for _, k := range state.forwardKeys {
+			if _, exists := m.entries[k]; exists {
+				surviving = append(surviving, k)
+			}
+		}
+		state.forwardKeys = surviving
+		if len(surviving) > 0 {
+			continue
+		}
+		state.mu.Lock()
+		if state.timer != nil {
+			state.timer.Stop()
+		}
+		state.mu.Unlock()
+		delete(m.vipStates, vipAddr)
+		if ip := net.ParseIP(vipAddr); ip != nil {
+			vipsToRelease = append(vipsToRelease, ip)
+		}
+	}
+	m.mu.Unlock()
+
+	if m.vipReleaser != nil {
+		for _, ip := range vipsToRelease {
+			if err := m.vipReleaser.ReleaseVIP(ip); err != nil {
+				m.logger.Warnw("failed to release VIP after per-context shutdown",
+					"vip", ip.String(), "error", err)
+			}
+		}
+	}
+
+	m.spdyPoolMu.Lock()
+	for key, pe := range m.spdyPool {
+		slash := strings.IndexByte(key, '/')
+		if slash < 0 {
+			continue
+		}
+		ctxName := key[:slash]
+		if _, hit := flush[ctxName]; !hit {
+			continue
+		}
+		m.logger.Debugw("dropping pooled SPDY connection on per-context shutdown", "key", key)
+		_ = pe.conn.Close()
+		delete(m.spdyPool, key)
+	}
+	m.spdyPoolMu.Unlock()
+}
+
+// splitEntryKey parses an entry key of the form "contextName/vipAddr:svcPort"
+// into the context name and VIP address. Returns ok=false on malformed input.
+func splitEntryKey(key string) (ctxName, vipAddr string, ok bool) {
+	slash := strings.IndexByte(key, '/')
+	if slash < 0 {
+		return "", "", false
+	}
+	rest := key[slash+1:]
+	colon := strings.LastIndexByte(rest, ':')
+	if colon < 0 {
+		return "", "", false
+	}
+	return key[:slash], rest[:colon], true
 }
 
 type portForwardStreams struct {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"sync"
 
 	"k8s.io/client-go/tools/clientcmd"
@@ -86,11 +87,12 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		prev := cm.MergedConfig()
 		if err := cm.Reset(RewriteForRegistrant(parsed)); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		h.shutdownTunnels()
+		h.shutdownTunnelsForContexts(ContextsToFlush(prev, cm.MergedConfig()))
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodPost:
@@ -104,6 +106,7 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		prev := cm.MergedConfig()
 		if err := cm.Add(RewriteForRegistrant(parsed)); err != nil {
 			var conflict *ConflictError
 			if errors.As(err, &conflict) {
@@ -113,7 +116,9 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			}
 			return
 		}
-		h.shutdownTunnels()
+		// Add() rejects on conflict, so surviving contexts can't have changed
+		// — only new ones were appended. Nothing to flush.
+		_ = prev
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodPatch:
@@ -127,16 +132,18 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		prev := cm.MergedConfig()
 		if err := cm.MergeAndOverwrite(RewriteForRegistrant(parsed)); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		h.shutdownTunnels()
+		h.shutdownTunnelsForContexts(ContextsToFlush(prev, cm.MergedConfig()))
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodDelete:
+		prev := cm.MergedConfig()
 		_ = cm.Reset(nil)
-		h.shutdownTunnels()
+		h.shutdownTunnelsForContexts(ContextsToFlush(prev, cm.MergedConfig()))
 		w.WriteHeader(http.StatusNoContent)
 
 	default:
@@ -145,15 +152,117 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-// shutdownTunnels shuts down all active port-forward tunnels if a ForwardManager
-// is configured. Tunnels will be re-established on next use.
-func (h *KubeconfigHandler) shutdownTunnels() {
+// shutdownTunnelsForContexts shuts down port-forward tunnels for the listed
+// kubeconfig context names. Tunnels for contexts not in the list — i.e.
+// peer worktrees that are sharing the daemon and whose cluster/auth data
+// did not change — keep running and serving in-flight TCP connections. The
+// previous always-on-shutdown semantics are equivalent to passing every
+// context name in the merged config.
+func (h *KubeconfigHandler) shutdownTunnelsForContexts(names []string) {
+	if len(names) == 0 {
+		return
+	}
 	h.mu.RLock()
 	fm := h.forwardManager
 	h.mu.RUnlock()
 	if fm != nil {
-		fm.Shutdown()
+		fm.ShutdownForContexts(names)
 	}
+}
+
+// ContextsToFlush returns the names of contexts whose port-forward listeners
+// must be torn down when the merged kubeconfig changes from old to new.
+// Contexts are flushed when they are removed entirely, or when their
+// referenced cluster's apiserver endpoint, certificate-authority data, or
+// proxy-url no longer matches; or when their referenced auth-info data
+// (client cert / key / token) changes. Contexts whose definitions are
+// byte-for-byte equivalent across old and new keep their listeners — this
+// is what lets parallel worktrees share the daemon without disrupting each
+// other's in-flight TCP connections on every peer registration.
+//
+// new == nil is treated as "everything was deleted" — every context in old
+// is flushed. old == nil short-circuits to no-op (nothing was forwarding).
+func ContextsToFlush(old, new *clientcmdapi.Config) []string {
+	if old == nil || len(old.Contexts) == 0 {
+		return nil
+	}
+	flush := make([]string, 0)
+	for name, oldCtx := range old.Contexts {
+		if new == nil {
+			flush = append(flush, name)
+			continue
+		}
+		newCtx, ok := new.Contexts[name]
+		if !ok {
+			flush = append(flush, name)
+			continue
+		}
+		if !clustersEquivalent(old.Clusters[oldCtx.Cluster], new.Clusters[newCtx.Cluster]) {
+			flush = append(flush, name)
+			continue
+		}
+		if !authInfosEquivalent(old.AuthInfos[oldCtx.AuthInfo], new.AuthInfos[newCtx.AuthInfo]) {
+			flush = append(flush, name)
+			continue
+		}
+	}
+	sort.Strings(flush)
+	return flush
+}
+
+// clustersEquivalent compares the fields of two Cluster entries that
+// determine whether existing port-forward listeners are still valid:
+// apiserver Server URL, certificate-authority data, and proxy-url. Other
+// fields (e.g. InsecureSkipTLSVerify, TLSServerName) also affect TLS but
+// are not part of the day-to-day churn between worktrees re-registering
+// the same cluster, so they're treated as significant here too.
+func clustersEquivalent(a, b *clientcmdapi.Cluster) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Server != b.Server || a.ProxyURL != b.ProxyURL {
+		return false
+	}
+	if a.InsecureSkipTLSVerify != b.InsecureSkipTLSVerify || a.TLSServerName != b.TLSServerName {
+		return false
+	}
+	if a.CertificateAuthority != b.CertificateAuthority {
+		return false
+	}
+	if !bytes.Equal(a.CertificateAuthorityData, b.CertificateAuthorityData) {
+		return false
+	}
+	return true
+}
+
+// authInfosEquivalent compares the fields of two AuthInfo entries that
+// determine client identity for an in-flight port-forward: client cert/key
+// data, token, and impersonation. Username/password are also compared even
+// though kfp doesn't use basic-auth, so a future migration doesn't silently
+// keep stale listeners.
+func authInfosEquivalent(a, b *clientcmdapi.AuthInfo) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Token != b.Token || a.TokenFile != b.TokenFile {
+		return false
+	}
+	if a.ClientCertificate != b.ClientCertificate || a.ClientKey != b.ClientKey {
+		return false
+	}
+	if !bytes.Equal(a.ClientCertificateData, b.ClientCertificateData) {
+		return false
+	}
+	if !bytes.Equal(a.ClientKeyData, b.ClientKeyData) {
+		return false
+	}
+	if a.Username != b.Username || a.Password != b.Password {
+		return false
+	}
+	if a.Impersonate != b.Impersonate {
+		return false
+	}
+	return true
 }
 
 // parseAndValidate decodes raw bytes as a kubeconfig and performs basic

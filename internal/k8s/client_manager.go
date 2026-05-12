@@ -88,6 +88,22 @@ func (cm *ClientManager) Kubeconfig() *clientcmdapi.Config {
 	return cm.dynamicConfig
 }
 
+// MergedConfig returns the merged (file + dynamic) kubeconfig. The result is
+// a freshly-loaded copy; callers can compare two snapshots taken across a
+// mutation to determine which contexts changed. Returns a non-nil empty
+// config on load failure so callers can treat the "before" snapshot of a
+// freshly-started daemon (no file kubeconfig, empty dynamic) as a zero
+// value.
+func (cm *ClientManager) MergedConfig() *clientcmdapi.Config {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	cfg, err := cm.mergedConfig()
+	if err != nil || cfg == nil {
+		return clientcmdapi.NewConfig()
+	}
+	return cfg
+}
+
 // Reset replaces the dynamic config entirely with cfg.
 func (cm *ClientManager) Reset(cfg *clientcmdapi.Config) error {
 	cm.mu.Lock()
