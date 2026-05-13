@@ -10,9 +10,9 @@ import (
 // ClusterIP service and returns a valid response.
 func TestSOCKS5_ClusterIP(t *testing.T) {
 	srv := startProxy(t)
-	setupSingleCluster(t, srv, "e2e-socks-cip", "nginx")
+	_, ns := setupSingleCluster(t, srv, "nginx")
 
-	body := httpGetViaSOCKS5(t, srv.SOCKSAddr, "http://nginx-clusterip.default.svc.cluster.local/")
+	body := httpGetViaSOCKS5(t, srv.SOCKSAddr, fmt.Sprintf("http://nginx-clusterip.%s.svc.cluster.local/", ns))
 	if !strings.Contains(body, "nginx") {
 		t.Fatalf("expected nginx response, got: %s", body)
 	}
@@ -23,9 +23,9 @@ func TestSOCKS5_ClusterIP(t *testing.T) {
 // headless FQDNs and tunnels traffic to the correct pod.
 func TestSOCKS5_HeadlessPod(t *testing.T) {
 	srv := startProxy(t)
-	setupSingleCluster(t, srv, "e2e-socks-hl", "nginx")
+	_, ns := setupSingleCluster(t, srv, "nginx")
 
-	body := httpGetViaSOCKS5(t, srv.SOCKSAddr, "http://nginx-0.nginx-headless.default.svc.cluster.local/")
+	body := httpGetViaSOCKS5(t, srv.SOCKSAddr, fmt.Sprintf("http://nginx-0.nginx-headless.%s.svc.cluster.local/", ns))
 	if !strings.Contains(body, "nginx") {
 		t.Fatalf("expected nginx response, got: %s", body)
 	}
@@ -37,7 +37,7 @@ func TestSOCKS5_HeadlessPod(t *testing.T) {
 // that exposes both ports. It verifies that both ports are reachable via SOCKS5.
 func TestSOCKS5_MultiPort(t *testing.T) {
 	srv := startProxy(t)
-	setupSingleClusterMultiPort(t, srv, "e2e-socks-mp", "nginx-mp")
+	ns := setupSingleClusterMultiPort(t, srv, "nginx-mp")
 
 	for _, tc := range []struct {
 		port int
@@ -46,7 +46,7 @@ func TestSOCKS5_MultiPort(t *testing.T) {
 		{80, "port 80"},
 		{8080, "port 8080"},
 	} {
-		url := fmt.Sprintf("http://nginx-mp-clusterip.default.svc.cluster.local:%d/", tc.port)
+		url := fmt.Sprintf("http://nginx-mp-clusterip.%s.svc.cluster.local:%d/", ns, tc.port)
 		body := httpGetViaSOCKS5(t, srv.SOCKSAddr, url)
 		if !strings.Contains(body, "nginx") {
 			t.Fatalf("expected nginx response on %s, got: %s", tc.name, body)

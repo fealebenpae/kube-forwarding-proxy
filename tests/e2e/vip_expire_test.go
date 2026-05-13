@@ -50,9 +50,9 @@ func resolveVIP(t *testing.T, dnsAddr, fqdn string) net.IP {
 // sleep for 2× the idle timeout and then do a single connectivity check.
 func TestVIPExpiry_ExpiresAfterIdleTimeout(t *testing.T) {
 	srv := startProxyWithIdleTimeout(t, vipIdleTimeout)
-	setupSingleCluster(t, srv, "e2e-vip-expire", "nginx")
+	_, ns := setupSingleCluster(t, srv, "nginx")
 
-	const fqdn = "nginx-clusterip.default.svc.cluster.local"
+	fqdn := fmt.Sprintf("nginx-clusterip.%s.svc.cluster.local", ns)
 
 	// Allocate VIP via DNS only (no TCP connection to the VIP).
 	// dnsLookupAExpect retries until the endpoint slice is propagated, so this
@@ -84,9 +84,9 @@ func TestVIPExpiry_ExpiresAfterIdleTimeout(t *testing.T) {
 // timer so the VIP survives past its original expiry deadline.
 func TestVIPExpiry_ResetByDNSQuery(t *testing.T) {
 	srv := startProxyWithIdleTimeout(t, vipIdleTimeout)
-	setupSingleCluster(t, srv, "e2e-vip-reset", "nginx")
+	_, ns := setupSingleCluster(t, srv, "nginx")
 
-	const fqdn = "nginx-clusterip.default.svc.cluster.local"
+	fqdn := fmt.Sprintf("nginx-clusterip.%s.svc.cluster.local", ns)
 
 	// Allocate VIP at t=0 via DNS only. Timer armed; expires at t≈5s.
 	vipAddr := resolveVIP(t, srv.DNSAddr, fqdn)
@@ -131,9 +131,9 @@ func TestVIPExpiry_ResetByDNSQuery(t *testing.T) {
 // connection closes.
 func TestVIPExpiry_PausedByActiveConnection(t *testing.T) {
 	srv := startProxyWithIdleTimeout(t, vipIdleTimeout)
-	setupSingleCluster(t, srv, "e2e-vip-pause", "nginx")
+	_, ns := setupSingleCluster(t, srv, "nginx")
 
-	const fqdn = "nginx-clusterip.default.svc.cluster.local"
+	fqdn := fmt.Sprintf("nginx-clusterip.%s.svc.cluster.local", ns)
 
 	// Allocate VIP via DNS only (activeConns=0; timer armed).
 	vipAddr := resolveVIP(t, srv.DNSAddr, fqdn)

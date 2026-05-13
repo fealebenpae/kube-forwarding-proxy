@@ -9,74 +9,53 @@ import (
 	mdns "github.com/miekg/dns"
 )
 
-// TestMulticluster_DNSVIP_ContextSuffix creates two kind clusters and verifies
-// that context-suffixed FQDNs route to the correct cluster via DNS+VIP.
+// TestMulticluster_DNSVIP_ContextSuffix verifies that context-suffixed FQDNs
+// route to the correct cluster via DNS+VIP.
 func TestMulticluster_DNSVIP_ContextSuffix(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
-	// Cluster A.
-	kubeconfigA := createKindCluster(t, "e2e-mc-dns-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "svc-alpha")
+	deployNginx(t, sharedA.clientset, ns, "svc-alpha")
+	deployNginx(t, sharedB.clientset, ns, "svc-beta")
 
-	// Cluster B.
-	kubeconfigB := createKindCluster(t, "e2e-mc-dns-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "svc-beta")
-
-	// Merge both kubeconfigs: PUT A, then PATCH B.
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
-
-	// Context names are "kind-<cluster-name>" by default.
-	ctxA := "kind-e2e-mc-dns-a"
-	ctxB := "kind-e2e-mc-dns-b"
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
 	// Test context-suffixed access to cluster A.
-	body := httpGetViaDNSVIP(t, srv.DNSAddr, "http://svc-alpha-clusterip.default.svc.cluster.local."+ctxA+"/")
+	body := httpGetViaDNSVIP(t, srv.DNSAddr, fmt.Sprintf("http://svc-alpha-clusterip.%s.svc.cluster.local.%s/", ns, sharedA.context))
 	if !strings.Contains(body, "nginx") {
 		t.Fatalf("expected nginx from cluster A, got: %s", body)
 	}
 	t.Logf("Cluster A via DNS+VIP context suffix: OK")
 
 	// Test context-suffixed access to cluster B.
-	body = httpGetViaDNSVIP(t, srv.DNSAddr, "http://svc-beta-clusterip.default.svc.cluster.local."+ctxB+"/")
+	body = httpGetViaDNSVIP(t, srv.DNSAddr, fmt.Sprintf("http://svc-beta-clusterip.%s.svc.cluster.local.%s/", ns, sharedB.context))
 	if !strings.Contains(body, "nginx") {
 		t.Fatalf("expected nginx from cluster B, got: %s", body)
 	}
 	t.Logf("Cluster B via DNS+VIP context suffix: OK")
 }
 
-// TestMulticluster_SOCKS5_ContextSuffix creates two kind clusters and verifies
-// that context-suffixed FQDNs route to the correct cluster via SOCKS5.
+// TestMulticluster_SOCKS5_ContextSuffix verifies that context-suffixed FQDNs
+// route to the correct cluster via SOCKS5.
 func TestMulticluster_SOCKS5_ContextSuffix(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
-	// Cluster A.
-	kubeconfigA := createKindCluster(t, "e2e-mc-sox-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "svc-alpha")
+	deployNginx(t, sharedA.clientset, ns, "svc-alpha")
+	deployNginx(t, sharedB.clientset, ns, "svc-beta")
 
-	// Cluster B.
-	kubeconfigB := createKindCluster(t, "e2e-mc-sox-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "svc-beta")
-
-	// Merge both kubeconfigs.
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
-
-	ctxA := "kind-e2e-mc-sox-a"
-	ctxB := "kind-e2e-mc-sox-b"
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
 	// Test SOCKS5 with context suffix.
-	body := httpGetViaSOCKS5(t, srv.SOCKSAddr, "http://svc-alpha-clusterip.default.svc.cluster.local."+ctxA+"/")
+	body := httpGetViaSOCKS5(t, srv.SOCKSAddr, fmt.Sprintf("http://svc-alpha-clusterip.%s.svc.cluster.local.%s/", ns, sharedA.context))
 	if !strings.Contains(body, "nginx") {
 		t.Fatalf("expected nginx from cluster A, got: %s", body)
 	}
 	t.Logf("Cluster A via SOCKS5 context suffix: OK")
 
-	body = httpGetViaSOCKS5(t, srv.SOCKSAddr, "http://svc-beta-clusterip.default.svc.cluster.local."+ctxB+"/")
+	body = httpGetViaSOCKS5(t, srv.SOCKSAddr, fmt.Sprintf("http://svc-beta-clusterip.%s.svc.cluster.local.%s/", ns, sharedB.context))
 	if !strings.Contains(body, "nginx") {
 		t.Fatalf("expected nginx from cluster B, got: %s", body)
 	}
@@ -87,15 +66,14 @@ func TestMulticluster_SOCKS5_ContextSuffix(t *testing.T) {
 // handles kubeconfig mutations: PUT, DELETE, and re-PUT with a different cluster.
 func TestMulticluster_KubeconfigLifecycle(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
-	// Cluster A.
-	kubeconfigA := createKindCluster(t, "e2e-mc-lc-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "nginx")
+	// Deploy nginx on cluster A.
+	deployNginx(t, sharedA.clientset, ns, "nginx")
 
 	// PUT cluster A config and verify connectivity.
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	body := httpGetViaSOCKS5(t, srv.SOCKSAddr, "http://nginx-clusterip.default.svc.cluster.local/")
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	body := httpGetViaSOCKS5(t, srv.SOCKSAddr, fmt.Sprintf("http://nginx-clusterip.%s.svc.cluster.local/", ns))
 	if !strings.Contains(body, "nginx") {
 		t.Fatalf("expected nginx response from cluster A, got: %s", body)
 	}
@@ -105,14 +83,12 @@ func TestMulticluster_KubeconfigLifecycle(t *testing.T) {
 	deleteKubeconfig(t, srv.HTTPAddr)
 	time.Sleep(2 * time.Second)
 
-	// Cluster B.
-	kubeconfigB := createKindCluster(t, "e2e-mc-lc-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "nginx")
+	// Deploy nginx on cluster B.
+	deployNginx(t, sharedB.clientset, ns, "nginx")
 
 	// PUT cluster B config and verify connectivity.
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigB)
-	body = httpGetViaSOCKS5(t, srv.SOCKSAddr, "http://nginx-clusterip.default.svc.cluster.local/")
+	putKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
+	body = httpGetViaSOCKS5(t, srv.SOCKSAddr, fmt.Sprintf("http://nginx-clusterip.%s.svc.cluster.local/", ns))
 	if !strings.Contains(body, "nginx") {
 		t.Fatalf("expected nginx response from cluster B, got: %s", body)
 	}
@@ -129,19 +105,15 @@ func TestMulticluster_KubeconfigLifecycle(t *testing.T) {
 // each VIP. It also confirms that traffic actually reaches nginx via both VIPs.
 func TestMulticluster_BareHostname_MultipleARecords(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
-	kubeconfigA := createKindCluster(t, "e2e-bare-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "shared")
+	deployNginx(t, sharedA.clientset, ns, "shared")
+	deployNginx(t, sharedB.clientset, ns, "shared")
 
-	kubeconfigB := createKindCluster(t, "e2e-bare-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "shared")
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
-
-	const fqdn = "shared-clusterip.default.svc.cluster.local"
+	fqdn := fmt.Sprintf("shared-clusterip.%s.svc.cluster.local", ns)
 
 	// A query: expect one VIP per cluster.
 	msg := dnsLookupAExpect(t, srv.DNSAddr, fqdn, 2)
@@ -182,20 +154,16 @@ func TestMulticluster_BareHostname_MultipleARecords(t *testing.T) {
 // returns exactly one A record (from the cluster that has the service).
 func TestMulticluster_BareHostname_ServiceOnlyInOneCluster(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
 	// Cluster A has "only-in-a-clusterip"; cluster B has a different service.
-	kubeconfigA := createKindCluster(t, "e2e-one-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "only-in-a")
+	deployNginx(t, sharedA.clientset, ns, "only-in-a")
+	deployNginx(t, sharedB.clientset, ns, "other-svc") // different name — won't match the query
 
-	kubeconfigB := createKindCluster(t, "e2e-one-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "other-svc") // different name — won't match the query
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
-
-	const fqdn = "only-in-a-clusterip.default.svc.cluster.local"
+	fqdn := fmt.Sprintf("only-in-a-clusterip.%s.svc.cluster.local", ns)
 
 	msg := dnsLookupAExpect(t, srv.DNSAddr, fqdn, 1)
 
@@ -210,19 +178,15 @@ func TestMulticluster_BareHostname_ServiceOnlyInOneCluster(t *testing.T) {
 // the allocated VIPs as TXT Answer records (ip=... context=... per entry).
 func TestMulticluster_BareHostname_TXT_AfterAQuery(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
-	kubeconfigA := createKindCluster(t, "e2e-txt-a-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "txtsvc")
+	deployNginx(t, sharedA.clientset, ns, "txtsvc")
+	deployNginx(t, sharedB.clientset, ns, "txtsvc")
 
-	kubeconfigB := createKindCluster(t, "e2e-txt-a-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "txtsvc")
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
-
-	const fqdn = "txtsvc-clusterip.default.svc.cluster.local"
+	fqdn := fmt.Sprintf("txtsvc-clusterip.%s.svc.cluster.local", ns)
 
 	// Trigger VIP allocation with an A query.
 	aMsg := dnsLookupAExpect(t, srv.DNSAddr, fqdn, 2)
@@ -259,20 +223,16 @@ func TestMulticluster_BareHostname_TXT_AfterAQuery(t *testing.T) {
 // NOERROR with an empty Answer section (NODATA) — not NXDOMAIN.
 func TestMulticluster_BareHostname_TXT_BeforeAQuery_NODATA(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
-	kubeconfigA := createKindCluster(t, "e2e-nodata-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "nodata-svc")
+	deployNginx(t, sharedA.clientset, ns, "nodata-svc")
+	deployNginx(t, sharedB.clientset, ns, "nodata-svc")
 
-	kubeconfigB := createKindCluster(t, "e2e-nodata-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "nodata-svc")
-
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
 	// No A query issued first; VIPs are not allocated.
-	const fqdn = "nodata-svc-clusterip.default.svc.cluster.local"
+	fqdn := fmt.Sprintf("nodata-svc-clusterip.%s.svc.cluster.local", ns)
 	msg := dnsLookupRaw(t, srv.DNSAddr, fqdn, mdns.TypeTXT)
 
 	if msg.Rcode != mdns.RcodeSuccess {
@@ -289,20 +249,16 @@ func TestMulticluster_BareHostname_TXT_BeforeAQuery_NODATA(t *testing.T) {
 // NXDOMAIN.
 func TestMulticluster_BareHostname_TXT_NXDOMAIN(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
 	// Register two clusters but don't create the queried service in either.
-	kubeconfigA := createKindCluster(t, "e2e-nx-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "other-svc")
+	deployNginx(t, sharedA.clientset, ns, "other-svc")
+	deployNginx(t, sharedB.clientset, ns, "other-svc")
 
-	kubeconfigB := createKindCluster(t, "e2e-nx-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "other-svc")
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
-
-	msg := dnsLookupRaw(t, srv.DNSAddr, "ghost-svc.default.svc.cluster.local", mdns.TypeTXT)
+	msg := dnsLookupRaw(t, srv.DNSAddr, fmt.Sprintf("ghost-svc.%s.svc.cluster.local", ns), mdns.TypeTXT)
 	if msg.Rcode != mdns.RcodeNameError {
 		t.Fatalf("expected NXDOMAIN (rcode 3), got rcode %d", msg.Rcode)
 	}
@@ -318,9 +274,9 @@ func TestMulticluster_BareHostname_TXT_NXDOMAIN(t *testing.T) {
 // Additional section.
 func TestMulticluster_ContextSuffix_TXTInAdditional(t *testing.T) {
 	srv := startProxy(t)
-	ctx := setupSingleCluster(t, srv, "e2e-ctx-suf", "ctxnginx")
+	ctxName, ns := setupSingleCluster(t, srv, "ctxnginx")
 
-	fqdn := fmt.Sprintf("ctxnginx-clusterip.default.svc.cluster.local.%s", ctx)
+	fqdn := fmt.Sprintf("ctxnginx-clusterip.%s.svc.cluster.local.%s", ns, ctxName)
 
 	// Retry until we get the A record (gives the VIP time to be allocated).
 	msg := dnsLookupAExpect(t, srv.DNSAddr, fqdn, 1)
@@ -334,8 +290,8 @@ func TestMulticluster_ContextSuffix_TXTInAdditional(t *testing.T) {
 		t.Fatalf("expected 1 TXT record in Additional section, got %d: %v", len(txtExtra), txtExtra)
 	}
 	txt := txtExtra[0]
-	if !strings.Contains(txt, fmt.Sprintf("context=%s", ctx)) {
-		t.Errorf("TXT record %q does not contain expected context %q", txt, ctx)
+	if !strings.Contains(txt, fmt.Sprintf("context=%s", ctxName)) {
+		t.Errorf("TXT record %q does not contain expected context %q", txt, ctxName)
 	}
 	if !strings.HasPrefix(txt, "ip=") {
 		t.Errorf("TXT record %q does not start with ip=", txt)
@@ -348,9 +304,9 @@ func TestMulticluster_ContextSuffix_TXTInAdditional(t *testing.T) {
 // for the same name returns the VIP as a TXT Answer record.
 func TestMulticluster_ContextSuffix_TXT_DirectQuery(t *testing.T) {
 	srv := startProxy(t)
-	ctx := setupSingleCluster(t, srv, "e2e-ctx-txt", "txtnginx")
+	ctxName, ns := setupSingleCluster(t, srv, "txtnginx")
 
-	fqdn := fmt.Sprintf("txtnginx-clusterip.default.svc.cluster.local.%s", ctx)
+	fqdn := fmt.Sprintf("txtnginx-clusterip.%s.svc.cluster.local.%s", ns, ctxName)
 
 	// Allocate the VIP first via an A query.
 	_ = dnsLookupAExpect(t, srv.DNSAddr, fqdn, 1)
@@ -364,8 +320,8 @@ func TestMulticluster_ContextSuffix_TXT_DirectQuery(t *testing.T) {
 	if len(txts) != 1 {
 		t.Fatalf("expected 1 TXT Answer record, got %d: %v", len(txts), txts)
 	}
-	if !strings.Contains(txts[0], fmt.Sprintf("context=%s", ctx)) {
-		t.Errorf("TXT %q missing expected context %q", txts[0], ctx)
+	if !strings.Contains(txts[0], fmt.Sprintf("context=%s", ctxName)) {
+		t.Errorf("TXT %q missing expected context %q", txts[0], ctxName)
 	}
 	t.Logf("Context-suffix TXT direct query: %s", txts[0])
 }
@@ -375,19 +331,15 @@ func TestMulticluster_ContextSuffix_TXT_DirectQuery(t *testing.T) {
 // cluster B returns NXDOMAIN when the B context suffix is used.
 func TestMulticluster_ContextSuffix_TXT_WrongContext_NXDOMAIN(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
-	kubeconfigA := createKindCluster(t, "e2e-wrong-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "wrnginx")
-
-	kubeconfigB := createKindCluster(t, "e2e-wrong-b")
+	deployNginx(t, sharedA.clientset, ns, "wrnginx")
 	// Don't deploy wrnginx in cluster B.
 
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
-	ctxB := "kind-e2e-wrong-b"
-	fqdn := fmt.Sprintf("wrnginx-clusterip.default.svc.cluster.local.%s", ctxB)
+	fqdn := fmt.Sprintf("wrnginx-clusterip.%s.svc.cluster.local.%s", ns, sharedB.context)
 
 	msg := dnsLookupRaw(t, srv.DNSAddr, fqdn, mdns.TypeTXT)
 	if msg.Rcode != mdns.RcodeNameError {
@@ -401,19 +353,15 @@ func TestMulticluster_ContextSuffix_TXT_WrongContext_NXDOMAIN(t *testing.T) {
 // new addresses on the second query.
 func TestMulticluster_BareHostname_VIPsAreDeduplicated(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
-	kubeconfigA := createKindCluster(t, "e2e-dedup-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "dedup")
+	deployNginx(t, sharedA.clientset, ns, "dedup")
+	deployNginx(t, sharedB.clientset, ns, "dedup")
 
-	kubeconfigB := createKindCluster(t, "e2e-dedup-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "dedup")
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
-
-	const fqdn = "dedup-clusterip.default.svc.cluster.local"
+	fqdn := fmt.Sprintf("dedup-clusterip.%s.svc.cluster.local", ns)
 
 	// First query — allocates VIPs.
 	msg1 := dnsLookupAExpect(t, srv.DNSAddr, fqdn, 2)
@@ -448,22 +396,15 @@ func TestMulticluster_BareHostname_VIPsAreDeduplicated(t *testing.T) {
 // per (cluster × port), with Targets pointing at the context-suffixed FQDNs.
 func TestMulticluster_SRV_NoContext(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
-	kubeconfigA := createKindCluster(t, "e2e-srv-mc-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "svc-mc")
+	deployNginx(t, sharedA.clientset, ns, "svc-mc")
+	deployNginx(t, sharedB.clientset, ns, "svc-mc")
 
-	kubeconfigB := createKindCluster(t, "e2e-srv-mc-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "svc-mc")
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
-
-	ctxA := "kind-e2e-srv-mc-a"
-	ctxB := "kind-e2e-srv-mc-b"
-
-	const fqdn = "svc-mc-clusterip.default.svc.cluster.local."
+	fqdn := fmt.Sprintf("svc-mc-clusterip.%s.svc.cluster.local.", ns)
 
 	// Trigger bare TypeA to allocate VIPs in both clusters.
 	dnsLookupAExpect(t, srv.DNSAddr, fqdn, 2)
@@ -477,8 +418,8 @@ func TestMulticluster_SRV_NoContext(t *testing.T) {
 	for _, s := range srvRecs {
 		targets[s.Target] = true
 	}
-	for _, ctx := range []string{ctxA, ctxB} {
-		want := "svc-mc-clusterip.default.svc.cluster.local." + ctx + "."
+	for _, ctx := range []string{sharedA.context, sharedB.context} {
+		want := fmt.Sprintf("svc-mc-clusterip.%s.svc.cluster.local.%s.", ns, ctx)
 		if !targets[want] {
 			t.Errorf("expected SRV Target %q, got targets: %v", want, targets)
 		}
@@ -490,29 +431,24 @@ func TestMulticluster_SRV_NoContext(t *testing.T) {
 // query returns only SRV records from the specified cluster.
 func TestMulticluster_SRV_ContextSpecified(t *testing.T) {
 	srv := startProxy(t)
+	ns := testNamespace(t)
 
-	kubeconfigA := createKindCluster(t, "e2e-srv-ctx-a")
-	csA := clientsetFromKubeconfig(t, kubeconfigA)
-	deployNginx(t, csA, "default", "svc-ctx")
+	deployNginx(t, sharedA.clientset, ns, "svc-ctx")
+	deployNginx(t, sharedB.clientset, ns, "svc-ctx")
 
-	kubeconfigB := createKindCluster(t, "e2e-srv-ctx-b")
-	csB := clientsetFromKubeconfig(t, kubeconfigB)
-	deployNginx(t, csB, "default", "svc-ctx")
-
-	putKubeconfig(t, srv.HTTPAddr, kubeconfigA)
-	patchKubeconfig(t, srv.HTTPAddr, kubeconfigB)
-
-	ctxA := "kind-e2e-srv-ctx-a"
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
 
 	// Allocate VIPs by querying the bare name first.
-	dnsLookupAExpect(t, srv.DNSAddr, "svc-ctx-clusterip.default.svc.cluster.local.", 2)
+	bareFQDN := fmt.Sprintf("svc-ctx-clusterip.%s.svc.cluster.local.", ns)
+	dnsLookupAExpect(t, srv.DNSAddr, bareFQDN, 2)
 
-	// Context-suffixed SRV — only ctxA records expected.
-	qname := "svc-ctx-clusterip.default.svc.cluster.local." + ctxA + "."
+	// Context-suffixed SRV — only sharedA records expected.
+	qname := fmt.Sprintf("svc-ctx-clusterip.%s.svc.cluster.local.%s.", ns, sharedA.context)
 	srvRecs := dnsLookupSRVExpect(t, srv.DNSAddr, qname, 1)
 
 	for _, s := range srvRecs {
-		wantTarget := "svc-ctx-clusterip.default.svc.cluster.local." + ctxA + "."
+		wantTarget := fmt.Sprintf("svc-ctx-clusterip.%s.svc.cluster.local.%s.", ns, sharedA.context)
 		if s.Target != wantTarget {
 			t.Errorf("SRV Target = %q, want %q", s.Target, wantTarget)
 		}

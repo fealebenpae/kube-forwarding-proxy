@@ -12,9 +12,9 @@ import (
 // ClusterIP service and that the VIP listener tunnels traffic to the pod.
 func TestDNSVIP_ClusterIP(t *testing.T) {
 	srv := startProxy(t)
-	setupSingleCluster(t, srv, "e2e-dns-cip", "nginx")
+	_, ns := setupSingleCluster(t, srv, "nginx")
 
-	body := httpGetViaDNSVIP(t, srv.DNSAddr, "http://nginx-clusterip.default.svc.cluster.local/")
+	body := httpGetViaDNSVIP(t, srv.DNSAddr, fmt.Sprintf("http://nginx-clusterip.%s.svc.cluster.local/", ns))
 	if !strings.Contains(body, "nginx") {
 		t.Fatalf("expected nginx response, got: %s", body)
 	}
@@ -25,9 +25,9 @@ func TestDNSVIP_ClusterIP(t *testing.T) {
 // to a VIP and traffic reaches the correct pod.
 func TestDNSVIP_HeadlessPod(t *testing.T) {
 	srv := startProxy(t)
-	setupSingleCluster(t, srv, "e2e-dns-hl", "nginx")
+	_, ns := setupSingleCluster(t, srv, "nginx")
 
-	body := httpGetViaDNSVIP(t, srv.DNSAddr, "http://nginx-0.nginx-headless.default.svc.cluster.local/")
+	body := httpGetViaDNSVIP(t, srv.DNSAddr, fmt.Sprintf("http://nginx-0.nginx-headless.%s.svc.cluster.local/", ns))
 	if !strings.Contains(body, "nginx") {
 		t.Fatalf("expected nginx response, got: %s", body)
 	}
@@ -51,7 +51,7 @@ func TestDNSVIP_NonClusterForwarding(t *testing.T) {
 // that exposes both ports. It verifies that both ports are reachable via DNS+VIP.
 func TestDNSVIP_MultiPort(t *testing.T) {
 	srv := startProxy(t)
-	setupSingleClusterMultiPort(t, srv, "e2e-dns-mp", "nginx-mp")
+	ns := setupSingleClusterMultiPort(t, srv, "nginx-mp")
 
 	for _, tc := range []struct {
 		port int
@@ -60,7 +60,7 @@ func TestDNSVIP_MultiPort(t *testing.T) {
 		{80, "port 80"},
 		{8080, "port 8080"},
 	} {
-		url := fmt.Sprintf("http://nginx-mp-clusterip.default.svc.cluster.local:%d/", tc.port)
+		url := fmt.Sprintf("http://nginx-mp-clusterip.%s.svc.cluster.local:%d/", ns, tc.port)
 		body := httpGetViaDNSVIP(t, srv.DNSAddr, url)
 		if !strings.Contains(body, "nginx") {
 			t.Fatalf("expected nginx response on %s, got: %s", tc.name, body)
@@ -78,12 +78,12 @@ func TestDNSVIP_MultiPort(t *testing.T) {
 // field matches the service's port and whose Target is the context-suffixed FQDN.
 func TestDNSVIP_SRV_AfterAQuery(t *testing.T) {
 	srv := startProxy(t)
-	ctxName := setupSingleCluster(t, srv, "e2e-srv-after-a", "nginx")
+	ctxName, ns := setupSingleCluster(t, srv, "nginx")
 
-	const qname = "nginx-clusterip.default.svc.cluster.local."
+	qname := fmt.Sprintf("nginx-clusterip.%s.svc.cluster.local.", ns)
 
 	// Trigger A query to allocate the VIP.
-	httpGetViaDNSVIP(t, srv.DNSAddr, "http://nginx-clusterip.default.svc.cluster.local/")
+	httpGetViaDNSVIP(t, srv.DNSAddr, fmt.Sprintf("http://nginx-clusterip.%s.svc.cluster.local/", ns))
 
 	// Now query SRV and expect at least one record for port 80.
 	srvRecs := dnsLookupSRVExpect(t, srv.DNSAddr, qname, 1)
@@ -93,7 +93,7 @@ func TestDNSVIP_SRV_AfterAQuery(t *testing.T) {
 		if s.Port == 80 {
 			portFound = true
 		}
-		wantTarget := "nginx-clusterip.default.svc.cluster.local." + ctxName + "."
+		wantTarget := fmt.Sprintf("nginx-clusterip.%s.svc.cluster.local.%s.", ns, ctxName)
 		if s.Target != wantTarget {
 			t.Errorf("SRV Target = %q, want %q", s.Target, wantTarget)
 		}
@@ -108,9 +108,9 @@ func TestDNSVIP_SRV_AfterAQuery(t *testing.T) {
 // non-existent service returns an NXDOMAIN response.
 func TestDNSVIP_SRV_DirectQuery_NXDOMAIN(t *testing.T) {
 	srv := startProxy(t)
-	setupSingleCluster(t, srv, "e2e-srv-nxd", "nginx")
+	_, ns := setupSingleCluster(t, srv, "nginx")
 
-	const qname = "does-not-exist.default.svc.cluster.local."
+	qname := fmt.Sprintf("does-not-exist.%s.svc.cluster.local.", ns)
 	msg := dnsLookupRaw(t, srv.DNSAddr, qname, mdns.TypeSRV)
 	if msg == nil {
 		t.Fatal("no response received")
@@ -126,10 +126,10 @@ func TestDNSVIP_SRV_DirectQuery_NXDOMAIN(t *testing.T) {
 // (NODATA semantics).
 func TestDNSVIP_SRV_DirectQuery_NODATA(t *testing.T) {
 	srv := startProxy(t)
-	setupSingleCluster(t, srv, "e2e-srv-nodata", "nginx")
+	_, ns := setupSingleCluster(t, srv, "nginx")
 
 	// Do NOT issue any TypeA query — no VIP should be allocated yet.
-	const qname = "nginx-clusterip.default.svc.cluster.local."
+	qname := fmt.Sprintf("nginx-clusterip.%s.svc.cluster.local.", ns)
 	msg := dnsLookupRaw(t, srv.DNSAddr, qname, mdns.TypeSRV)
 	if msg == nil {
 		t.Fatal("no response received")
@@ -149,9 +149,9 @@ func TestDNSVIP_SRV_DirectQuery_NODATA(t *testing.T) {
 // of a TypeA response contains SRV records alongside the TXT records.
 func TestDNSVIP_SRV_TypeA_ExtraSection(t *testing.T) {
 	srv := startProxy(t)
-	setupSingleCluster(t, srv, "e2e-srv-extra", "nginx")
+	_, ns := setupSingleCluster(t, srv, "nginx")
 
-	const qname = "nginx-clusterip.default.svc.cluster.local."
+	qname := fmt.Sprintf("nginx-clusterip.%s.svc.cluster.local.", ns)
 
 	// TypeA query — triggers VIP allocation.
 	msg := dnsLookupRaw(t, srv.DNSAddr, qname, mdns.TypeA)
@@ -178,12 +178,12 @@ func TestDNSVIP_SRV_TypeA_ExtraSection(t *testing.T) {
 // two SRV records (one per port) after a TypeA query allocates the VIP.
 func TestDNSVIP_SRV_MultiPort(t *testing.T) {
 	srv := startProxy(t)
-	setupSingleClusterMultiPort(t, srv, "e2e-srv-mp", "nginx-mp")
+	ns := setupSingleClusterMultiPort(t, srv, "nginx-mp")
 
 	// Trigger TypeA to allocate the VIP.
-	httpGetViaDNSVIP(t, srv.DNSAddr, "http://nginx-mp-clusterip.default.svc.cluster.local/")
+	httpGetViaDNSVIP(t, srv.DNSAddr, fmt.Sprintf("http://nginx-mp-clusterip.%s.svc.cluster.local/", ns))
 
-	const qname = "nginx-mp-clusterip.default.svc.cluster.local."
+	qname := fmt.Sprintf("nginx-mp-clusterip.%s.svc.cluster.local.", ns)
 	srvRecs := dnsLookupSRVExpect(t, srv.DNSAddr, qname, 2)
 
 	ports := make(map[uint16]bool)

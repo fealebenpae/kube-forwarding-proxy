@@ -1,8 +1,10 @@
 // Package e2e contains end-to-end tests for the k8s-service-proxy.
 //
-// Each test creates its own in-process proxy instance and kind cluster(s), so
-// the full suite can be run with a plain `go test ./tests/e2e/` — no Docker
-// Compose stack or external process is required.
+// Two shared kind clusters are created once in TestMain and reused across all
+// tests. Each test creates its own in-process proxy instance and deploys
+// services in a unique namespace for isolation. The full suite can be run with
+// a plain `go test ./tests/e2e/` — no Docker Compose stack or external process
+// is required.
 package e2e
 
 import (
@@ -37,13 +39,31 @@ import (
 const nginxFixtureImage = "nginx:alpine"
 
 // ---------------------------------------------------------------------------
+// Shared kind clusters
+// ---------------------------------------------------------------------------
+
+// kindCluster holds the state for a pre-created kind cluster.
+type kindCluster struct {
+	kubeconfig string
+	clientset  kubernetes.Interface
+	context    string
+}
+
+// sharedA and sharedB are kind clusters created once in TestMain and reused
+// across all tests. Single-cluster tests use sharedA; multi-cluster tests
+// use both.
+var (
+	sharedA kindCluster
+	sharedB kindCluster
+)
+
+// ---------------------------------------------------------------------------
 // Test suite entry point
 // ---------------------------------------------------------------------------
 
-// TestMain pulls nginx:alpine into the local Docker daemon once for the whole
-// test suite. Each call to createKindCluster then loads the image from the
-// local daemon into the kind node with `kind load docker-image`, so no cluster
-// ever needs to contact Docker Hub during a test run.
+// TestMain pulls nginx:alpine into the local Docker daemon, then creates two
+// shared kind clusters (in parallel) for the whole test suite. Individual
+// tests deploy services in per-test namespaces for isolation.
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
@@ -61,7 +81,137 @@ func TestMain(m *testing.M) {
 			rc.Close()
 		}
 	}
-	os.Exit(m.Run())
+
+	// Create two shared kind clusters in parallel.
+	provider := cluster.NewProvider()
+	type result struct {
+		kc  kindCluster
+		err error
+	}
+	chA := make(chan result, 1)
+	chB := make(chan result, 1)
+	go func() {
+		kc, err := createSharedCluster(provider, "e2e-shared-a")
+		chA <- result{kc, err}
+	}()
+	go func() {
+		kc, err := createSharedCluster(provider, "e2e-shared-b")
+		chB <- result{kc, err}
+	}()
+
+	rA := <-chA
+	rB := <-chB
+	if rA.err != nil || rB.err != nil {
+		if rA.err != nil {
+			fmt.Fprintf(os.Stderr, "creating shared cluster A: %v\n", rA.err)
+		}
+		if rB.err != nil {
+			fmt.Fprintf(os.Stderr, "creating shared cluster B: %v\n", rB.err)
+		}
+		_ = provider.Delete("e2e-shared-a", "")
+		_ = provider.Delete("e2e-shared-b", "")
+		os.Exit(1)
+	}
+	sharedA = rA.kc
+	sharedB = rB.kc
+
+	code := m.Run()
+
+	// Tear down shared clusters.
+	_ = provider.Delete("e2e-shared-a", "")
+	_ = provider.Delete("e2e-shared-b", "")
+
+	os.Exit(code)
+}
+
+// createSharedCluster creates a kind cluster suitable for reuse across tests.
+func createSharedCluster(provider *cluster.Provider, name string) (kindCluster, error) {
+	fmt.Fprintf(os.Stderr, "creating shared kind cluster %q\n", name)
+	if err := provider.Create(name, cluster.CreateWithWaitForReady(5*time.Minute)); err != nil {
+		return kindCluster{}, fmt.Errorf("creating kind cluster %s: %w", name, err)
+	}
+
+	loadNginxImageIntoCluster(provider, name)
+
+	raw, err := provider.KubeConfig(name, false)
+	if err != nil {
+		return kindCluster{}, fmt.Errorf("getting kubeconfig for %s: %w", name, err)
+	}
+
+	restCfg, err := clientcmd.RESTConfigFromKubeConfig([]byte(raw))
+	if err != nil {
+		return kindCluster{}, fmt.Errorf("building REST config for %s: %w", name, err)
+	}
+	restCfg.TLSClientConfig.Insecure = true
+	restCfg.TLSClientConfig.CAData = nil
+
+	cs, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return kindCluster{}, fmt.Errorf("creating clientset for %s: %w", name, err)
+	}
+
+	kubecfg, err := clientcmd.Load([]byte(raw))
+	if err != nil {
+		return kindCluster{}, fmt.Errorf("loading kubeconfig for %s: %w", name, err)
+	}
+
+	return kindCluster{
+		kubeconfig: raw,
+		clientset:  cs,
+		context:    kubecfg.CurrentContext,
+	}, nil
+}
+
+// loadNginxImageIntoCluster loads the nginx fixture image from the local Docker
+// daemon into every node of the named kind cluster.
+func loadNginxImageIntoCluster(provider *cluster.Provider, name string) {
+	nodes, err := provider.ListInternalNodes(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: listing nodes for %s: %v\n", name, err)
+		return
+	}
+	dockerCli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: creating docker client for %s: %v\n", name, err)
+		return
+	}
+	defer dockerCli.Close()
+	for _, node := range nodes {
+		rc, err := dockerCli.ImageSave(context.Background(), []string{nginxFixtureImage})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: docker save %s: %v\n", nginxFixtureImage, err)
+			break
+		}
+		if err := node.Command("ctr", "--namespace=k8s.io", "images", "import",
+			"--digests", "--snapshotter=overlayfs", "-").SetStdin(rc).Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: loading %s into node %s: %v\n", nginxFixtureImage, node, err)
+		}
+		rc.Close()
+	}
+}
+
+// testNamespace returns a Kubernetes-safe namespace name derived from the test name.
+func testNamespace(t *testing.T) string {
+	t.Helper()
+	raw := strings.ToLower(t.Name())
+	var b strings.Builder
+	prev := byte('-')
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			b.WriteByte(c)
+			prev = c
+		} else if prev != '-' {
+			b.WriteByte('-')
+			prev = '-'
+		}
+	}
+	name := strings.Trim(b.String(), "-")
+	if len(name) > 63 {
+		name = name[:63]
+		name = strings.TrimRight(name, "-")
+	}
+	return name
 }
 
 // ---------------------------------------------------------------------------
@@ -112,9 +262,10 @@ func startProxyCustom(t *testing.T, mutate func(*app.Config)) *app.Server {
 // kind cluster helpers
 // ---------------------------------------------------------------------------
 
-// createKindCluster creates a kind cluster and returns the raw kubeconfig YAML.
-// The kubeconfig's API server points to 127.0.0.1:<nodePort>, which is
-// reachable directly from the host process without any Docker networking.
+// createKindCluster creates a dedicated kind cluster and returns the raw
+// kubeconfig YAML. Prefer using the shared clusters (sharedA / sharedB) in
+// most tests; this function is available for tests that need a dedicated
+// cluster with custom lifecycle.
 func createKindCluster(t *testing.T, name string) string {
 	t.Helper()
 	p := cluster.NewProvider()
@@ -130,50 +281,12 @@ func createKindCluster(t *testing.T, name string) string {
 		}
 	})
 
-	// Load nginx:alpine from the local Docker daemon into every cluster node so
-	// pods never need to pull from Docker Hub during the test. ImageSave streams
-	// a Docker-format tar; we pipe it straight into `ctr images import` on the
-	// node. We call ctr directly (not via nodeutils.LoadImageArchive) because
-	// that helper hardcodes --all-platforms which is incompatible with the
-	// Docker-format archive produced by ImageSave.
-	if clusterNodes, err := p.ListInternalNodes(name); err != nil {
-		t.Logf("warning: listing nodes for %s: %v", name, err)
-	} else if dockerCli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation()); err != nil {
-		t.Logf("warning: creating docker client: %v", err)
-	} else {
-		defer dockerCli.Close()
-		for _, node := range clusterNodes {
-			rc, err := dockerCli.ImageSave(context.Background(), []string{nginxFixtureImage})
-			if err != nil {
-				t.Logf("warning: docker save %s: %v", nginxFixtureImage, err)
-				break
-			}
-			// overlayfs is the default containerd snapshotter for Linux kind nodes.
-			if err := node.Command("ctr", "--namespace=k8s.io", "images", "import",
-				"--digests", "--snapshotter=overlayfs", "-").SetStdin(rc).Run(); err != nil {
-				t.Logf("warning: loading %s into node %s: %v", nginxFixtureImage, node, err)
-			}
-			rc.Close()
-		}
-	}
+	loadNginxImageIntoCluster(p, name)
 
 	raw, err := p.KubeConfig(name, false)
 	if err != nil {
 		t.Fatalf("getting kubeconfig for %s: %v", name, err)
 	}
-
-	// // Wait for the default service account to exist before returning, so
-	// // callers can immediately create resources without a separate wait step.
-	// cs := clientsetFromKubeconfig(t, raw)
-	// saCtx, saCancel := context.WithTimeout(context.Background(), 60*time.Second)
-	// defer saCancel()
-	// if err := wait.PollUntilContextCancel(saCtx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
-	// 	_, err := cs.CoreV1().ServiceAccounts("default").Get(ctx, "default", metav1.GetOptions{})
-	// 	return err == nil, nil
-	// }); err != nil {
-	// 	t.Fatalf("cluster %s: default service account not ready within 60s", name)
-	// }
-
 	return raw
 }
 
@@ -472,35 +585,26 @@ func httpGetViaSOCKS5(t *testing.T, socksAddr, url string) string {
 // Shared test setup
 // ---------------------------------------------------------------------------
 
-// setupSingleCluster creates a kind cluster, pushes its kubeconfig to the
-// proxy, and deploys nginx in the default namespace. It returns the kind
-// context name (e.g. "kind-<clusterName>") for use in context-suffix tests.
-func setupSingleCluster(t *testing.T, srv *app.Server, clusterName, svcPrefix string) string {
+// setupSingleCluster uses shared cluster A, deploys nginx in a test-specific
+// namespace, and pushes the kubeconfig to the proxy. Returns the context name
+// and namespace.
+func setupSingleCluster(t *testing.T, srv *app.Server, svcPrefix string) (ctxName, namespace string) {
 	t.Helper()
-
-	kubeconfig := createKindCluster(t, clusterName)
-	putKubeconfig(t, srv.HTTPAddr, kubeconfig)
-
-	cs := clientsetFromKubeconfig(t, kubeconfig)
-	deployNginx(t, cs, "default", svcPrefix)
-
-	cfg, err := clientcmd.Load([]byte(kubeconfig))
-	if err != nil {
-		t.Fatalf("loading kubeconfig: %v", err)
-	}
-	return cfg.CurrentContext
+	ns := testNamespace(t)
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	deployNginx(t, sharedA.clientset, ns, svcPrefix)
+	return sharedA.context, ns
 }
 
-// setupSingleClusterMultiPort creates a kind cluster, pushes its kubeconfig to
-// the proxy, and deploys a multi-port nginx setup in the default namespace.
-func setupSingleClusterMultiPort(t *testing.T, srv *app.Server, clusterName, svcPrefix string) {
+// setupSingleClusterMultiPort uses shared cluster A, deploys multi-port nginx
+// in a test-specific namespace, and pushes the kubeconfig to the proxy.
+// Returns the namespace.
+func setupSingleClusterMultiPort(t *testing.T, srv *app.Server, svcPrefix string) string {
 	t.Helper()
-
-	kubeconfig := createKindCluster(t, clusterName)
-	putKubeconfig(t, srv.HTTPAddr, kubeconfig)
-
-	cs := clientsetFromKubeconfig(t, kubeconfig)
-	deployNginxMultiPort(t, cs, "default", svcPrefix)
+	ns := testNamespace(t)
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	deployNginxMultiPort(t, sharedA.clientset, ns, svcPrefix)
+	return ns
 }
 
 // deployNginxMultiPort creates a pod with two nginx containers — one serving on
