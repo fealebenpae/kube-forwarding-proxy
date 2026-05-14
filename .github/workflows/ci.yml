@@ -47,6 +47,21 @@ jobs:
       - name: Run e2e tests
         run: ./tests/e2e/run.sh
 
+  e2e-macos:
+    name: E2E Tests (macOS)
+    runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Set up Docker
+        uses: docker/setup-docker-action@v5
+        with:
+          set-host: true
+      - name: Run e2e tests
+        run: sudo -E go test -v -count=1 -timeout 30m ./tests/e2e/
+
   docker-build:
     name: Build Docker Image
     runs-on: ubuntu-latest
