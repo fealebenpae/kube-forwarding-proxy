@@ -10,6 +10,7 @@ type ifconfigInterfaceAddressManager struct {
 	iface *net.Interface
 }
 
+// NewInterfaceAddressManager returns an InterfaceAddressManager backed by ifconfig for the named interface.
 func NewInterfaceAddressManager(iface string) (InterfaceAddressManager, error) {
 	ifi, err := net.InterfaceByName(iface)
 	if err != nil {

@@ -3,11 +3,14 @@ package k8s
 import (
 	"context"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/util/httpstream"
 )
 
 // mockVIPReleaser records calls to ReleaseVIP.
@@ -40,7 +43,13 @@ func newExpiryForwardManager(releaser VIPReleaser, idleTimeout time.Duration) *F
 // injectEntry adds a real TCP listener + vipState directly into a ForwardManager
 // for test purposes, bypassing the Kubernetes API surface of StartForward.
 // Returns the listener and the entry key so callers can make assertions.
-func injectEntry(t *testing.T, m *ForwardManager, vipAddr string) (net.Listener, string) {
+func injectEntry(t *testing.T, m *ForwardManager, vipAddr string) (net.Listener, forwardKey) {
+	t.Helper()
+	return injectEntryForContext(t, m, "test-ctx", vipAddr)
+}
+
+// injectEntryForContext is like injectEntry but lets the caller choose the context name.
+func injectEntryForContext(t *testing.T, m *ForwardManager, contextName, vipAddr string) (net.Listener, forwardKey) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -48,14 +57,14 @@ func injectEntry(t *testing.T, m *ForwardManager, vipAddr string) (net.Listener,
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
-	key := "test-ctx/" + vipAddr + ":8080"
+	key := forwardKey{contextName: contextName, vipAddr: vipAddr, svcPort: 8080}
 	_, cancel := context.WithCancel(context.Background())
 	entry := &forwardEntry{listener: ln, cancel: cancel}
 
 	m.mu.Lock()
 	m.entries[key] = entry
 	if _, ok := m.vipStates[vipAddr]; !ok {
-		m.vipStates[vipAddr] = &vipState{forwardKeys: []string{key}}
+		m.vipStates[vipAddr] = &vipState{forwardKeys: []forwardKey{key}}
 	} else {
 		m.vipStates[vipAddr].forwardKeys = append(m.vipStates[vipAddr].forwardKeys, key)
 	}
@@ -249,4 +258,117 @@ func acceptWithTimeout(ln net.Listener, d time.Duration) error {
 	}
 	_, err := ln.Accept()
 	return err
+}
+
+// TestShutdownContext verifies that ShutdownContext tears down only the
+// listeners, vipStates, SPDY pool entries, and VIPs belonging to the named
+// context, leaving every other context's resources intact.
+func TestShutdownContext(t *testing.T) {
+	releaser := &mockVIPReleaser{}
+	m := newExpiryForwardManager(releaser, 0) // idle expiry disabled; releaser still wired
+
+	// Inject two contexts with one listener (and vipState) each.
+	vipA := "127.9.0.1"
+	vipB := "127.9.0.2"
+	lnA, keyA := injectEntryForContext(t, m, "ctx-a", vipA)
+	lnB, _ := injectEntryForContext(t, m, "ctx-b", vipB)
+
+	// Inject a fake SPDY pool entry for each context.
+	fakeConnA := &fakeCloser{}
+	fakeConnB := &fakeCloser{}
+	m.spdyPoolMu.Lock()
+	m.spdyPool[spdyKey{"ctx-a", "default", "pod-a"}] = &poolEntry{conn: fakeConnA}
+	m.spdyPool[spdyKey{"ctx-b", "default", "pod-b"}] = &poolEntry{conn: fakeConnB}
+	m.spdyPoolMu.Unlock()
+
+	// Shut down only ctx-a.
+	m.ShutdownContext("ctx-a")
+
+	// --- ctx-a must be gone ---
+
+	// Listener for ctx-a must be closed.
+	if err := acceptWithTimeout(lnA, 10*time.Millisecond); err == nil {
+		t.Error("ctx-a listener should be closed after ShutdownContext")
+	}
+
+	// Entry must be removed from the map.
+	m.mu.Lock()
+	_, aEntryPresent := m.entries[keyA]
+	_, aStatePresent := m.vipStates[vipA]
+	m.mu.Unlock()
+	if aEntryPresent {
+		t.Error("ctx-a entry must be removed after ShutdownContext")
+	}
+	if aStatePresent {
+		t.Error("ctx-a vipState must be removed after ShutdownContext")
+	}
+
+	// VIP for ctx-a must have been released.
+	relIPs := releaser.releasedIPs()
+	if len(relIPs) != 1 {
+		t.Fatalf("ReleaseVIP called %d times, want 1", len(relIPs))
+	}
+	if !relIPs[0].Equal(net.ParseIP(vipA)) {
+		t.Errorf("ReleaseVIP called with %s, want %s", relIPs[0], vipA)
+	}
+
+	// SPDY pool entry for ctx-a must be closed and removed.
+	if !fakeConnA.closed {
+		t.Error("ctx-a SPDY connection must be closed after ShutdownContext")
+	}
+	m.spdyPoolMu.Lock()
+	_, aSPDYPresent := m.spdyPool[spdyKey{"ctx-a", "default", "pod-a"}]
+	m.spdyPoolMu.Unlock()
+	if aSPDYPresent {
+		t.Error("ctx-a SPDY pool entry must be removed after ShutdownContext")
+	}
+
+	// --- ctx-b must be untouched ---
+
+	// ctx-b listener must still be open.
+	_ = lnB.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Millisecond))
+	_, err := lnB.Accept()
+	if err != nil {
+		// A deadline/timeout error means the listener is alive (no connections arrived).
+		// An error whose string contains "use of closed" would mean it was closed — bad.
+		if isClosedErr(err) {
+			t.Error("ctx-b listener must still be open after ShutdownContext(ctx-a)")
+		}
+	}
+
+	m.mu.Lock()
+	_, bStatePresent := m.vipStates[vipB]
+	m.mu.Unlock()
+	if !bStatePresent {
+		t.Error("ctx-b vipState must still be present after ShutdownContext(ctx-a)")
+	}
+
+	if fakeConnB.closed {
+		t.Error("ctx-b SPDY connection must not be closed after ShutdownContext(ctx-a)")
+	}
+	m.spdyPoolMu.Lock()
+	_, bSPDYPresent := m.spdyPool[spdyKey{"ctx-b", "default", "pod-b"}]
+	m.spdyPoolMu.Unlock()
+	if !bSPDYPresent {
+		t.Error("ctx-b SPDY pool entry must still be present after ShutdownContext(ctx-a)")
+	}
+}
+
+// fakeCloser implements httpstream.Connection minimally for pool-entry tests.
+type fakeCloser struct {
+	closed bool
+}
+
+func (f *fakeCloser) Close() error                                          { f.closed = true; return nil }
+func (f *fakeCloser) CreateStream(_ http.Header) (httpstream.Stream, error) { return nil, nil }
+func (f *fakeCloser) CloseChan() <-chan bool                                { return nil }
+func (f *fakeCloser) SetIdleTimeout(_ time.Duration)                        {}
+func (f *fakeCloser) RemoveStreams(_ ...httpstream.Stream)                  {}
+
+// isClosedErr reports whether err looks like a "use of closed network connection" error.
+func isClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "use of closed")
 }

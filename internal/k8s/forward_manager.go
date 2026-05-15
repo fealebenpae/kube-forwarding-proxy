@@ -25,6 +25,28 @@ type VIPReleaser interface {
 	ReleaseVIP(ip net.IP) error
 }
 
+// forwardKey uniquely identifies a TCP listener managed by ForwardManager.
+type forwardKey struct {
+	contextName string
+	vipAddr     string
+	svcPort     int32
+}
+
+func (k forwardKey) String() string {
+	return fmt.Sprintf("%s/%s:%d", k.contextName, k.vipAddr, k.svcPort)
+}
+
+// spdyKey uniquely identifies a pooled SPDY connection managed by ForwardManager.
+type spdyKey struct {
+	contextName string
+	namespace   string
+	podName     string
+}
+
+func (k spdyKey) String() string {
+	return k.contextName + "/" + k.namespace + "/" + k.podName
+}
+
 // forwardEntry holds the TCP listener and the cancel func for its accept-loop goroutine.
 type forwardEntry struct {
 	listener net.Listener
@@ -39,7 +61,7 @@ type vipState struct {
 	timer       *time.Timer // nil when idleTimeout is zero
 	generation  uint64      // incremented on every timer re-arm; stale callbacks abort
 	activeConns atomic.Int32
-	forwardKeys []string // m.entries keys that belong to this VIP
+	forwardKeys []forwardKey // m.entries keys that belong to this VIP
 }
 
 // poolEntry is a cached SPDY connection shared across concurrent DialPortForward
@@ -77,11 +99,11 @@ type ForwardManager struct {
 	// mu protects entries and vipStates. Lock ordering: always m.mu before
 	// state.mu. Never hold m.mu while calling vipReleaser.
 	mu        sync.Mutex
-	entries   map[string]*forwardEntry // "contextName/vip:svcPort" -> entry
-	vipStates map[string]*vipState     // vipAddr string -> state
+	entries   map[forwardKey]*forwardEntry // forwardKey{contextName, vipAddr, svcPort} -> entry
+	vipStates map[string]*vipState         // vipAddr string -> state
 
 	spdyPoolMu sync.Mutex
-	spdyPool   map[string]*poolEntry // "contextName/namespace/podName" -> entry
+	spdyPool   map[spdyKey]*poolEntry // spdyKey{contextName, namespace, podName} -> entry
 }
 
 // NewForwardManager creates a new ForwardManager.
@@ -94,9 +116,9 @@ func NewForwardManager(clients *ClientManager, resolver *Resolver, logger *zap.S
 		logger:      logger,
 		vipReleaser: vipReleaser,
 		idleTimeout: idleTimeout,
-		entries:     make(map[string]*forwardEntry),
+		entries:     make(map[forwardKey]*forwardEntry),
 		vipStates:   make(map[string]*vipState),
-		spdyPool:    make(map[string]*poolEntry),
+		spdyPool:    make(map[spdyKey]*poolEntry),
 	}
 }
 
@@ -113,7 +135,7 @@ func (m *ForwardManager) StartForward(_ context.Context, contextName, vipAddr st
 	if contextName == "" {
 		contextName = m.clients.CurrentContextName()
 	}
-	key := contextName + "/" + fmt.Sprintf("%s:%d", vipAddr, svcPort)
+	key := forwardKey{contextName: contextName, vipAddr: vipAddr, svcPort: svcPort}
 
 	m.mu.Lock()
 	if _, exists := m.entries[key]; exists {
@@ -150,7 +172,7 @@ func (m *ForwardManager) StartForward(_ context.Context, contextName, vipAddr st
 		if state, ok := m.vipStates[vipAddr]; ok {
 			state.forwardKeys = append(state.forwardKeys, key)
 		} else {
-			m.vipStates[vipAddr] = &vipState{forwardKeys: []string{key}}
+			m.vipStates[vipAddr] = &vipState{forwardKeys: []forwardKey{key}}
 		}
 		m.touchVIPLocked(vipAddr)
 	}
@@ -355,7 +377,7 @@ func (m *ForwardManager) handleConn(ctx context.Context, conn net.Conn, contextN
 // acquirePoolEntry returns a *poolEntry with refs already incremented. It
 // reuses a live cached connection for poolKey when one exists, or dials a
 // fresh SPDY connection and stores it in the pool.
-func (m *ForwardManager) acquirePoolEntry(poolKey string, upgrader spdy.Upgrader, transport http.RoundTripper, reqURL *url.URL) (*poolEntry, error) {
+func (m *ForwardManager) acquirePoolEntry(poolKey spdyKey, upgrader spdy.Upgrader, transport http.RoundTripper, reqURL *url.URL) (*poolEntry, error) {
 	m.spdyPoolMu.Lock()
 	defer m.spdyPoolMu.Unlock()
 
@@ -388,7 +410,7 @@ func (m *ForwardManager) acquirePoolEntry(poolKey string, upgrader spdy.Upgrader
 // buildOnClose returns the ref-counting cleanup callback for a poolEntry.
 // When the last streamConn backed by e is closed, the entry is evicted from
 // the pool and the underlying SPDY connection is closed.
-func (m *ForwardManager) buildOnClose(poolKey string, e *poolEntry) func() {
+func (m *ForwardManager) buildOnClose(poolKey spdyKey, e *poolEntry) func() {
 	return func() {
 		if e.refs.Add(-1) != 0 {
 			return
@@ -461,7 +483,7 @@ func (m *ForwardManager) DialPortForward(ctx context.Context, contextName, names
 		return nil, fmt.Errorf("creating SPDY round tripper: %w", err)
 	}
 
-	poolKey := contextName + "/" + endpoint.Namespace + "/" + endpoint.PodName
+	poolKey := spdyKey{contextName: contextName, namespace: endpoint.Namespace, podName: endpoint.PodName}
 	portStr := fmt.Sprintf("%d", podPort)
 
 	entry, err := m.acquirePoolEntry(poolKey, upgrader, transport, reqURL)
@@ -502,6 +524,72 @@ func (m *ForwardManager) DialPortForward(ctx context.Context, contextName, names
 	)
 
 	return newStreamConn(streams.data, streams.error, nil, m.buildOnClose(poolKey, entry), m.logger, endpoint.PodName), nil
+}
+
+// ShutdownContext closes all active listeners, cancels idle-expiry timers, and
+// closes all pooled SPDY connections that belong to contextName. Resources owned
+// by other contexts are left untouched, so active connections to those clusters
+// are not interrupted.
+//
+// Any VIPs that were allocated exclusively for contextName are released from the
+// network interface via vipReleaser (if set), giving the replaced cluster a clean
+// slate on next use. VIP release happens outside m.mu to preserve the same
+// lock-order invariant as expireVIP.
+func (m *ForwardManager) ShutdownContext(contextName string) {
+	// Collect the unique VIP addresses that belong to this context so we can
+	// release them after dropping the lock.
+	uniqueVIPs := make(map[string]net.IP)
+
+	m.mu.Lock()
+	for key, entry := range m.entries {
+		if key.contextName != contextName {
+			continue
+		}
+		m.logger.Infow("stopping port-forward listener", "key", key)
+		entry.cancel()
+		_ = entry.listener.Close()
+		delete(m.entries, key)
+
+		if ip := net.ParseIP(key.vipAddr); ip != nil {
+			uniqueVIPs[key.vipAddr] = ip
+		}
+	}
+	for vipAddr := range uniqueVIPs {
+		if state, ok := m.vipStates[vipAddr]; ok {
+			state.mu.Lock()
+			if state.timer != nil {
+				state.timer.Stop()
+			}
+			state.mu.Unlock()
+			delete(m.vipStates, vipAddr)
+		}
+	}
+	m.mu.Unlock()
+
+	// Release VIPs outside m.mu — same pattern as expireVIP to avoid lock-order
+	// inversion with the allocator's internal mutex.
+	if m.vipReleaser != nil {
+		for _, ip := range uniqueVIPs {
+			if err := m.vipReleaser.ReleaseVIP(ip); err != nil {
+				m.logger.Warnw("failed to release VIP for context",
+					"context", contextName,
+					"vip", ip,
+					"error", err,
+				)
+			}
+		}
+	}
+
+	m.spdyPoolMu.Lock()
+	for key, pe := range m.spdyPool {
+		if key.contextName != contextName {
+			continue
+		}
+		m.logger.Debugw("closing pooled SPDY connection", "key", key)
+		_ = pe.conn.Close()
+		delete(m.spdyPool, key)
+	}
+	m.spdyPoolMu.Unlock()
 }
 
 // Shutdown closes all active listeners, stops their accept loops, and closes

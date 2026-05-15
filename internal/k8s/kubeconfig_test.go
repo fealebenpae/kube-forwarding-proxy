@@ -3,12 +3,16 @@ package k8s
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 // minimalKubeconfig returns a syntactically valid kubeconfig YAML pointing to
@@ -322,4 +326,141 @@ func TestKubeconfig_POST_ConflictBody_MentionsConflictingName(t *testing.T) {
 	if !strings.Contains(body, "shared") {
 		t.Errorf("conflict body %q does not mention conflicting name", body)
 	}
+}
+
+// --- affectedContexts ---
+
+// TestAffectedContexts_NilOld returns nil when there is no previous config.
+func TestAffectedContexts_NilOld(t *testing.T) {
+	newCfg := buildConfig("c1", "ctx1", "u1", "https://localhost:1")
+	if got := affectedContexts(nil, newCfg); len(got) != 0 {
+		t.Errorf("affectedContexts(nil, new) = %v, want empty", got)
+	}
+}
+
+// TestAffectedContexts_RemovedContext returns the context that is absent from the new config.
+func TestAffectedContexts_RemovedContext(t *testing.T) {
+	old := buildConfig("c1", "ctx1", "u1", "https://localhost:1")
+	newCfg := buildConfig("c2", "ctx2", "u2", "https://localhost:2")
+	got := affectedContexts(old, newCfg)
+	if len(got) != 1 || got[0] != "ctx1" {
+		t.Errorf("affectedContexts = %v, want [ctx1]", got)
+	}
+}
+
+// TestAffectedContexts_NilNew returns all old context names.
+func TestAffectedContexts_NilNew(t *testing.T) {
+	old := buildConfig("c1", "ctx1", "u1", "https://localhost:1")
+	got := affectedContexts(old, nil)
+	if len(got) != 1 || got[0] != "ctx1" {
+		t.Errorf("affectedContexts(old, nil) = %v, want [ctx1]", got)
+	}
+}
+
+// TestAffectedContexts_UnchangedContext returns nothing when config is identical.
+func TestAffectedContexts_UnchangedContext(t *testing.T) {
+	cfg := buildConfig("c1", "ctx1", "u1", "https://localhost:1")
+	if got := affectedContexts(cfg, cfg); len(got) != 0 {
+		t.Errorf("affectedContexts(same, same) = %v, want empty", got)
+	}
+}
+
+// TestAffectedContexts_ChangedClusterServer returns the context when the
+// cluster server URL changes.
+func TestAffectedContexts_ChangedClusterServer(t *testing.T) {
+	old := buildConfig("c1", "ctx1", "u1", "https://localhost:1111")
+	newCfg := buildConfig("c1", "ctx1", "u1", "https://localhost:2222")
+	got := affectedContexts(old, newCfg)
+	if len(got) != 1 || got[0] != "ctx1" {
+		t.Errorf("affectedContexts = %v, want [ctx1]", got)
+	}
+}
+
+// --- Per-context shutdown integration ---
+
+// newTestHandlerWithFM creates a KubeconfigHandler wired to a real
+// ClientManager and a ForwardManager that has no VIPReleaser (safe for tests
+// that only check listener closure).
+func newTestHandlerWithFM(t *testing.T) (*KubeconfigHandler, *ForwardManager) {
+	t.Helper()
+	cm, err := NewClientManager(zap.NewNop().Sugar())
+	if err != nil {
+		t.Fatalf("NewClientManager: %v", err)
+	}
+	fm := NewForwardManager(cm, nil, zap.NewNop().Sugar(), nil, 0)
+	h := &KubeconfigHandler{}
+	h.SetManagers(cm, fm)
+	return h, fm
+}
+
+// TestKubeconfig_PUT_OnlyShutdownsReplacedContext verifies that replacing the
+// kubeconfig via PUT shuts down tunnels only for contexts that changed or were
+// removed, leaving other contexts' listeners open.
+func TestKubeconfig_PUT_OnlyShutdownsReplacedContext(t *testing.T) {
+	h, fm := newTestHandlerWithFM(t)
+
+	// Seed both contexts via PUT + PATCH.
+	if r := do(t, h, http.MethodPut, minimalKubeconfig("cA", "ctx-a", "uA", "https://localhost:8881")); r.StatusCode != 204 {
+		t.Fatalf("PUT ctx-a: %d", r.StatusCode)
+	}
+	if r := do(t, h, http.MethodPatch, minimalKubeconfig("cB", "ctx-b", "uB", "https://localhost:8882")); r.StatusCode != 204 {
+		t.Fatalf("PATCH ctx-b: %d", r.StatusCode)
+	}
+
+	// Inject listeners for both contexts directly into the ForwardManager.
+	lnA, _ := injectEntryForContext(t, fm, "ctx-a", "127.10.0.1")
+	lnB, _ := injectEntryForContext(t, fm, "ctx-b", "127.10.0.2")
+
+	// PUT only ctx-a (removes ctx-b from dynamic config).
+	if r := do(t, h, http.MethodPut, minimalKubeconfig("cA", "ctx-a", "uA", "https://localhost:8881")); r.StatusCode != 204 {
+		t.Fatalf("PUT ctx-a only: %d", r.StatusCode)
+	}
+
+	// ctx-b listener must now be closed.
+	// timeout/deadline errors are fine — they only indicate no connection arrived
+	// on a live listener. A "use of closed" error confirms the listener is dead.
+	if err := acceptWithTimeout(lnB, 10*time.Millisecond); err == nil {
+		t.Error("ctx-b listener should be closed after ctx-b was removed by PUT")
+	}
+
+	// ctx-a listener must still be open (deadline/timeout, not closed).
+	_ = lnA.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Millisecond))
+	_, err := lnA.Accept()
+	if isClosedErr(err) {
+		t.Error("ctx-a listener must still be open after PUT that kept ctx-a unchanged")
+	}
+}
+
+// TestKubeconfig_POST_DoesNotShutdownAnyTunnel verifies that POST (which only
+// adds new entries) never shuts down existing tunnels.
+func TestKubeconfig_POST_DoesNotShutdownAnyTunnel(t *testing.T) {
+	h, fm := newTestHandlerWithFM(t)
+
+	if r := do(t, h, http.MethodPut, minimalKubeconfig("cA", "ctx-a", "uA", "https://localhost:8883")); r.StatusCode != 204 {
+		t.Fatalf("PUT ctx-a: %d", r.StatusCode)
+	}
+
+	lnA, _ := injectEntryForContext(t, fm, "ctx-a", "127.10.0.3")
+
+	// POST a brand-new context.
+	if r := do(t, h, http.MethodPost, minimalKubeconfig("cB", "ctx-b", "uB", "https://localhost:8884")); r.StatusCode != 204 {
+		t.Fatalf("POST ctx-b: %d", r.StatusCode)
+	}
+
+	// ctx-a listener must still be open.
+	_ = lnA.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Millisecond))
+	_, err := lnA.Accept()
+	if isClosedErr(err) {
+		t.Error("ctx-a listener must not be closed after a POST that only added a new context")
+	}
+}
+
+// buildConfig is a test helper that constructs a minimal *clientcmdapi.Config.
+func buildConfig(clusterName, contextName, userName, server string) *clientcmdapi.Config {
+	kc := minimalKubeconfig(clusterName, contextName, userName, server)
+	cfg, err := clientcmd.Load([]byte(kc))
+	if err != nil {
+		panic("buildConfig: " + err.Error())
+	}
+	return cfg
 }

@@ -88,6 +88,15 @@ func (cm *ClientManager) Kubeconfig() *clientcmdapi.Config {
 	return cm.dynamicConfig
 }
 
+// MergedConfig returns a snapshot of the fully-merged kubeconfig (file-based
+// config plus the in-memory dynamic config). It is safe to call concurrently.
+// The returned value is a copy and may be used freely without holding any lock.
+func (cm *ClientManager) MergedConfig() (*clientcmdapi.Config, error) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.mergedConfig()
+}
+
 // Reset replaces the dynamic config entirely with cfg.
 func (cm *ClientManager) Reset(cfg *clientcmdapi.Config) error {
 	cm.mu.Lock()
