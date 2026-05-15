@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"sync"
 
 	"k8s.io/client-go/tools/clientcmd"
@@ -86,11 +87,13 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		oldCfg, _ := cm.MergedConfig()
 		if err := cm.Reset(parsed); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		h.shutdownTunnels()
+		newCfg, _ := cm.MergedConfig()
+		h.shutdownTunnelsForContexts(affectedContexts(oldCfg, newCfg))
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodPost:
@@ -104,6 +107,7 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		oldCfg, _ := cm.MergedConfig()
 		if err := cm.Add(parsed); err != nil {
 			var conflict *ConflictError
 			if errors.As(err, &conflict) {
@@ -113,7 +117,10 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			}
 			return
 		}
-		h.shutdownTunnels()
+		newCfg, _ := cm.MergedConfig()
+		// POST never overwrites existing entries so affectedContexts will always
+		// return an empty slice; this is a no-op in practice.
+		h.shutdownTunnelsForContexts(affectedContexts(oldCfg, newCfg))
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodPatch:
@@ -127,16 +134,20 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		oldCfg, _ := cm.MergedConfig()
 		if err := cm.MergeAndOverwrite(parsed); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		h.shutdownTunnels()
+		newCfg, _ := cm.MergedConfig()
+		h.shutdownTunnelsForContexts(affectedContexts(oldCfg, newCfg))
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodDelete:
+		oldCfg, _ := cm.MergedConfig()
 		_ = cm.Reset(nil)
-		h.shutdownTunnels()
+		newCfg, _ := cm.MergedConfig()
+		h.shutdownTunnelsForContexts(affectedContexts(oldCfg, newCfg))
 		w.WriteHeader(http.StatusNoContent)
 
 	default:
@@ -145,15 +156,59 @@ func (h *KubeconfigHandler) handleKubeconfig(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-// shutdownTunnels shuts down all active port-forward tunnels if a ForwardManager
-// is configured. Tunnels will be re-established on next use.
-func (h *KubeconfigHandler) shutdownTunnels() {
+// shutdownTunnelsForContexts calls ShutdownContext for each name in the slice.
+// It is a no-op when names is empty or when no ForwardManager is configured.
+func (h *KubeconfigHandler) shutdownTunnelsForContexts(names []string) {
+	if len(names) == 0 {
+		return
+	}
 	h.mu.RLock()
 	fm := h.forwardManager
 	h.mu.RUnlock()
-	if fm != nil {
-		fm.Shutdown()
+	if fm == nil {
+		return
 	}
+	for _, name := range names {
+		fm.ShutdownContext(name)
+	}
+}
+
+// affectedContexts returns the names of contexts in oldCfg that are absent
+// from newCfg or whose effective configuration changed (context entry, the
+// cluster it references, or the auth info it references). newCfg may be nil,
+// in which case all context names from oldCfg are returned.
+func affectedContexts(oldCfg, newCfg *clientcmdapi.Config) []string {
+	if oldCfg == nil {
+		return nil
+	}
+	var affected []string
+	for name, oldCtx := range oldCfg.Contexts {
+		if newCfg == nil {
+			affected = append(affected, name)
+			continue
+		}
+		newCtx, exists := newCfg.Contexts[name]
+		if !exists {
+			affected = append(affected, name)
+			continue
+		}
+		if !reflect.DeepEqual(oldCtx, newCtx) {
+			affected = append(affected, name)
+			continue
+		}
+		oldCluster := oldCfg.Clusters[oldCtx.Cluster]
+		newCluster := newCfg.Clusters[newCtx.Cluster]
+		if !reflect.DeepEqual(oldCluster, newCluster) {
+			affected = append(affected, name)
+			continue
+		}
+		oldAuth := oldCfg.AuthInfos[oldCtx.AuthInfo]
+		newAuth := newCfg.AuthInfos[newCtx.AuthInfo]
+		if !reflect.DeepEqual(oldAuth, newAuth) {
+			affected = append(affected, name)
+		}
+	}
+	return affected
 }
 
 // parseAndValidate decodes raw bytes as a kubeconfig and performs basic

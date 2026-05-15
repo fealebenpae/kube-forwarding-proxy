@@ -6,7 +6,12 @@
 # Requirements: docker (compose v2)
 #
 # Usage:
-#   ./tests/e2e/run.sh
+#   ./tests/e2e/run.sh [go-test-flags...]
+#
+# Examples:
+#   ./tests/e2e/run.sh                          # run all tests
+#   ./tests/e2e/run.sh -test.run TestDNS        # run a specific test
+#   ./tests/e2e/run.sh -test.run 'TestVIP.*'    # run tests matching a pattern
 
 set -euo pipefail
 
@@ -36,7 +41,7 @@ docker compose -f "$COMPOSE_FILE" build --pull 2>&1 >&2
 # ── Run tests ───────────────────────────────────────────────────────────────
 echo "=== Running e2e tests ===" >&2
 set +e
-docker compose -f "$COMPOSE_FILE" run --rm test-runner 2>&1
+docker compose -f "$COMPOSE_FILE" run --rm test-runner "$@" 2>&1
 EXIT_CODE=$?
 set -e
 

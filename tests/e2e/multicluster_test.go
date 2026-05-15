@@ -1,7 +1,10 @@
 package e2e
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -457,4 +460,149 @@ func TestMulticluster_SRV_ContextSpecified(t *testing.T) {
 		t.Errorf("expected exactly 1 SRV record for context-specific query, got %d", len(srvRecs))
 	}
 	t.Logf("Multicluster context-specific SRV: OK")
+}
+
+// ---------------------------------------------------------------------------
+// Cluster replacement isolation test
+// ---------------------------------------------------------------------------
+
+// TestMulticluster_ClusterReplacement_PreservesOtherConnections verifies the
+// core isolation guarantee of per-cluster teardown: an active TCP connection
+// to cluster A must survive a cluster B replacement uninterrupted, and cluster
+// B must become fully operational again after re-registration.
+//
+// Scenario:
+//  1. Start proxy with both clusters (A and B).
+//  2. Open a raw TCP connection to cluster A's VIP and hold it open.
+//  3. PUT only cluster A's kubeconfig — effectively "replacing" cluster B by
+//     removing it from the dynamic config. This triggers ShutdownContext for B.
+//  4. Assert the held cluster-A connection is still alive (not EOF'd).
+//  5. Assert new cluster-A connections still work.
+//  6. Re-add cluster B via PATCH.
+//  7. Assert cluster B's service is reachable again with a freshly allocated VIP.
+//  8. Perform a final HTTP exchange on the original held connection to prove it
+//     was usable throughout.
+func TestMulticluster_ClusterReplacement_PreservesOtherConnections(t *testing.T) {
+	srv := startProxy(t)
+	ns := testNamespace(t)
+
+	deployNginx(t, sharedA.clientset, ns, "svc-alpha")
+	deployNginx(t, sharedB.clientset, ns, "svc-beta")
+
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
+
+	// --- Step 1: resolve VIPs for both clusters ---
+
+	fqdnA := fmt.Sprintf("svc-alpha-clusterip.%s.svc.cluster.local.%s", ns, sharedA.context)
+	fqdnB := fmt.Sprintf("svc-beta-clusterip.%s.svc.cluster.local.%s", ns, sharedB.context)
+
+	vipA := resolveVIP(t, srv.DNSAddr, fqdnA)
+	vipB := resolveVIP(t, srv.DNSAddr, fqdnB)
+
+	if !checkTCPConnectable(vipA, 80) {
+		t.Fatalf("cluster A VIP %s:80 not reachable before replacement", vipA)
+	}
+	if !checkTCPConnectable(vipB, 80) {
+		t.Fatalf("cluster B VIP %s:80 not reachable before replacement", vipB)
+	}
+	t.Logf("both clusters reachable: vipA=%s vipB=%s", vipA, vipB)
+
+	// --- Step 2: open and hold a raw TCP connection to cluster A ---
+	//
+	// Accepting this connection causes the proxy to call handleConn → DialPortForward,
+	// establishing a SPDY stream to an nginx pod on cluster A. The bidirectional
+	// io.Copy loop starts inside the proxy goroutine, keeping the SPDY stream alive
+	// as long as connA is open.
+
+	connA, err := net.DialTimeout("tcp", fmt.Sprintf("%s:80", vipA), 10*time.Second)
+	if err != nil {
+		t.Fatalf("dialing cluster A VIP %s:80: %v", vipA, err)
+	}
+	t.Cleanup(func() { _ = connA.Close() })
+	t.Logf("cluster A TCP connection open: %s -> %s", connA.LocalAddr(), connA.RemoteAddr())
+
+	// Give the proxy a moment to finish setting up the SPDY port-forward so
+	// that the connection is fully proxied before we proceed.
+	time.Sleep(200 * time.Millisecond)
+
+	// --- Step 3: replace cluster B (PUT only cluster A) ---
+
+	t.Log("replacing cluster B: PUT kubeconfig with only cluster A")
+	putKubeconfig(t, srv.HTTPAddr, sharedA.kubeconfig)
+
+	// --- Step 4: assert connA is still alive ---
+	//
+	// Set a very short read deadline and read. If the proxy dropped the connection
+	// we'll receive io.EOF or a closed-connection error. A deadline-exceeded error
+	// (or os.ErrDeadlineExceeded) means the server hasn't sent data yet — but the
+	// connection is intact.
+
+	_ = connA.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+	buf := make([]byte, 1)
+	_, readErr := connA.Read(buf)
+	_ = connA.SetReadDeadline(time.Time{}) // clear deadline
+	if readErr != nil {
+		if errors.Is(readErr, io.EOF) {
+			t.Fatal("cluster A TCP connection was closed (EOF) during cluster B replacement — isolation failed")
+		}
+		if isNetClosedErr(readErr) {
+			t.Fatalf("cluster A TCP connection was closed during cluster B replacement: %v", readErr)
+		}
+		// Any other error (timeout/deadline exceeded) means the connection is alive.
+		t.Logf("cluster A connection alive after cluster B replacement (read returned %v as expected)", readErr)
+	} else {
+		t.Logf("cluster A connection alive (read 1 byte — proxy sent data early)")
+	}
+
+	// --- Step 5: new connections to cluster A still work ---
+
+	if !checkTCPConnectable(vipA, 80) {
+		t.Errorf("new cluster A connections not working after cluster B replacement")
+	}
+	t.Log("new cluster A connections: OK")
+
+	// --- Step 6: re-add cluster B ---
+
+	t.Log("re-adding cluster B via PATCH")
+	patchKubeconfig(t, srv.HTTPAddr, sharedB.kubeconfig)
+
+	// --- Step 7: cluster B reachable again with fresh VIP ---
+	//
+	// The old VIP-B was released when cluster B was removed; a DNS query now
+	// allocates a new one (may or may not be the same address).
+
+	newVipB := resolveVIP(t, srv.DNSAddr, fqdnB)
+	t.Logf("cluster B VIP after re-add: %s", newVipB)
+	waitForTCPReachable(t, newVipB, 80, 30*time.Second)
+	t.Log("cluster B reachable after re-registration: OK")
+
+	// --- Step 8: perform a full HTTP exchange on the still-held connA ---
+	//
+	// Send an HTTP/1.0 GET so the server closes the connection after the response,
+	// giving us a clean EOF that terminates the Read loop.
+
+	host := fmt.Sprintf("%s:80", vipA)
+	_, writeErr := fmt.Fprintf(connA, "GET / HTTP/1.0\r\nHost: %s\r\n\r\n", host)
+	if writeErr != nil {
+		t.Fatalf("writing HTTP request on held cluster A connection: %v", writeErr)
+	}
+	_ = connA.SetReadDeadline(time.Now().Add(15 * time.Second))
+	body, readAllErr := io.ReadAll(connA)
+	if readAllErr != nil && !errors.Is(readAllErr, io.EOF) {
+		t.Fatalf("reading HTTP response on held cluster A connection: %v", readAllErr)
+	}
+	if !strings.Contains(string(body), "nginx") && !strings.Contains(string(body), "200") {
+		t.Errorf("unexpected response on held cluster A connection (want nginx/200 OK):\n%s", string(body))
+	}
+	t.Logf("full HTTP exchange on original connA succeeded — connection was intact throughout: OK")
+}
+
+// isNetClosedErr reports whether err looks like a "use of closed network
+// connection" error, which indicates the proxy dropped the connection.
+func isNetClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "use of closed")
 }
