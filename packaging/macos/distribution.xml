@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>k8s-proxy</title>
+    <options customize="never" require-scripts="true"/>
+    <allowed-os-versions>
+        <os-version min="14.0"/>
+    </allowed-os-versions>
+    <pkg-ref id="io.github.fealebenpae.k8s-proxy"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="io.github.fealebenpae.k8s-proxy"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="io.github.fealebenpae.k8s-proxy" visible="false">
+        <pkg-ref id="io.github.fealebenpae.k8s-proxy"/>
+    </choice>
+    <pkg-ref id="io.github.fealebenpae.k8s-proxy" version="0" onConclusion="none">component.pkg</pkg-ref>
+</installer-gui-script>

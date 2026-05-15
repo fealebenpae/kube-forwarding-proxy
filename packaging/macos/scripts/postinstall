@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+
+# Create the log directory (not in the payload so it survives uninstall).
+mkdir -p /var/log/k8s-proxy
+
+# Load the daemon into the system launchd domain.
+launchctl bootstrap system /Library/LaunchDaemons/io.github.fealebenpae.k8s-proxy.plist

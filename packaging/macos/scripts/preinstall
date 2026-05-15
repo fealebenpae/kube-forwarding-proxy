@@ -1,0 +1,4 @@
+#!/bin/bash
+# Unload the existing service before files are replaced (handles upgrade).
+# Silently ignored on a fresh install where the daemon has never been loaded.
+launchctl bootout system /Library/LaunchDaemons/io.github.fealebenpae.k8s-proxy.plist 2>/dev/null || true

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.fealebenpae.k8s-proxy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/k8s-service-proxy</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DNS_LISTEN</key>
+        <string>127.0.0.1:11617</string>
+        <key>HTTP_LISTEN</key>
+        <string>127.0.0.1:11616</string>
+        <key>INTERFACE</key>
+        <string>lo0</string>
+        <key>VIP_CIDR</key>
+        <string>127.2.0.0/16</string>
+        <key>KUBECONFIG</key>
+        <string>/dev/null</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/k8s-proxy/stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/k8s-proxy/stderr.log</string>
+</dict>
+</plist>
